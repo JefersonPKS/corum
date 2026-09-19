@@ -257,6 +257,26 @@ pub struct LoginFailure {
     pub extra_data: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionKey {
+    pub server_key: [u8; ENCRYPTION_KEY_LENGTH],
+}
+
+impl EncryptionKey {
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        header(bytes, STATUS_LOGIN, CMD_ENCRYPTION_KEY)?;
+        if bytes.len() != 2 + ENCRYPTION_KEY_LENGTH {
+            return Err(WireError::UnexpectedLength {
+                expected: (2 + ENCRYPTION_KEY_LENGTH).to_string(),
+                actual: bytes.len(),
+            });
+        }
+        Ok(Self {
+            server_key: bytes[2..].try_into().unwrap(),
+        })
+    }
+}
+
 impl LoginFailure {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         header(bytes, STATUS_LOGIN, CMD_LOGIN_FAIL)?;

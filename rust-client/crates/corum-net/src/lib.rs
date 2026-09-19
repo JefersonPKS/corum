@@ -7,11 +7,13 @@
 //! alterar os codecs de `corum-wire`.
 
 use corum_wire::{
+    CharacterSelectRequest, EncryptionKey, LoginFailure, LoginRequest, LoginSuccess,
     CHARACTER_SUMMARY_SIZE, CMD_CHARACTER_SELECT_FAIL, CMD_CREATE_CHARACTER_SUCCESS,
     CMD_ENCRYPTION_KEY, CMD_LOGIN_FAIL, CMD_LOGIN_SUCCESS, STATUS_CHARACTER_SELECT, STATUS_LOGIN,
 };
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 
 const MAX_PACKET_SIZE: usize = 4 + 4 * CHARACTER_SUMMARY_SIZE;
 
@@ -21,6 +23,49 @@ pub enum NetError {
     InvalidPacket { status: u8, command: u8 },
     InvalidCharacterCount(u8),
     PacketTooLarge { size: usize, maximum: usize },
+}
+
+#[derive(Debug)]
+pub enum SessionError {
+    Transport(NetError),
+    Wire(corum_wire::WireError),
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "session transport: {error}"),
+            Self::Wire(error) => write!(formatter, "session packet: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            Self::Wire(error) => Some(error),
+        }
+    }
+}
+
+impl From<NetError> for SessionError {
+    fn from(error: NetError) -> Self {
+        Self::Transport(error)
+    }
+}
+
+impl From<corum_wire::WireError> for SessionError {
+    fn from(error: corum_wire::WireError) -> Self {
+        Self::Wire(error)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginReply {
+    Success(LoginSuccess),
+    Failure(LoginFailure),
+    EncryptionKey(EncryptionKey),
 }
 
 impl fmt::Display for NetError {
@@ -69,6 +114,12 @@ pub struct PacketConnection<S> {
     stream: S,
 }
 
+impl PacketConnection<TcpStream> {
+    pub fn connect(address: impl ToSocketAddrs) -> Result<Self, NetError> {
+        Ok(Self::new(TcpStream::connect(address)?))
+    }
+}
+
 impl<S> PacketConnection<S> {
     #[must_use]
     pub const fn new(stream: S) -> Self {
@@ -107,6 +158,34 @@ impl<S: Read + Write> PacketConnection<S> {
         self.stream.read_exact(&mut rest)?;
         output.extend(rest);
         Ok(output)
+    }
+
+    /// Envia o primeiro pacote do estado de login e decodifica a resposta do `LoginAgent`.
+    ///
+    /// Quando o servidor responde com `EncryptionKey`, a conexão está viva, mas a derivação da
+    /// chave precisa ser ligada ao algoritmo legado antes de reenviar o login. Retornar essa
+    /// variante evita tratar uma sessão criptografada como uma falha de senha.
+    pub fn authenticate(&mut self, request: &LoginRequest) -> Result<LoginReply, SessionError> {
+        self.send(&request.encode()?)?;
+        let packet = self.receive_session_packet()?;
+        match packet.get(1).copied() {
+            Some(CMD_LOGIN_SUCCESS) => Ok(LoginReply::Success(LoginSuccess::decode(&packet)?)),
+            Some(CMD_LOGIN_FAIL) => Ok(LoginReply::Failure(LoginFailure::decode(&packet)?)),
+            Some(CMD_ENCRYPTION_KEY) => {
+                Ok(LoginReply::EncryptionKey(EncryptionKey::decode(&packet)?))
+            }
+            _ => Err(NetError::InvalidPacket {
+                status: packet[0],
+                command: packet[1],
+            }
+            .into()),
+        }
+    }
+
+    /// Envia a seleção de um dos quatro slots. A resposta de entrada no WorldServer será
+    /// adicionada quando o pacote `WORLD_USER_INFO` fizer parte do próximo bloco de codecs.
+    pub fn select_character(&mut self, request: CharacterSelectRequest) -> Result<(), NetError> {
+        self.send(&request.encode())
     }
 }
 
@@ -232,5 +311,26 @@ mod tests {
             connection.receive_session_packet(),
             Err(NetError::Io(error)) if error.kind() == ErrorKind::UnexpectedEof
         ));
+    }
+
+    #[test]
+    fn authenticates_against_an_in_memory_login_agent_reply() {
+        let mut input = vec![STATUS_LOGIN, CMD_LOGIN_FAIL, 6, 0, 0, 0, 0];
+        let stream = Chunked {
+            input: Cursor::new(std::mem::take(&mut input)),
+            output: Vec::new(),
+            chunk_size: 2,
+        };
+        let mut connection = PacketConnection::new(stream);
+        let request = LoginRequest::new("tester", "secret", 0x0703_2101);
+        let reply = connection.authenticate(&request).unwrap();
+        assert_eq!(
+            reply,
+            LoginReply::Failure(LoginFailure {
+                result: 6,
+                extra_data: 0
+            })
+        );
+        assert_eq!(connection.into_inner().output.len(), 51);
     }
 }

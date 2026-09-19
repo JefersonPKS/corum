@@ -55,6 +55,17 @@ pub fn decode(file: &[u8]) -> Result<Vec<u8>, CdbError> {
         .collect())
 }
 
+/// O inverso de `decode`: cifra um corpo e antepõe o tamanho (a cifra é XOR, portanto simétrica).
+#[must_use]
+pub fn encode(body: &[u8]) -> Vec<u8> {
+    let length = u32::try_from(body.len()).expect("a CDB body is smaller than 4 GiB");
+    let mut file = length.to_le_bytes().to_vec();
+    file.extend(body.iter().enumerate().map(|(index, byte)| {
+        byte ^ DECODE_KEY[index % DECODE_KEY.len()].wrapping_add(DECODE_SUBKEY)
+    }));
+    file
+}
+
 /// Registro de tamanho fixo de uma tabela (layout `pack(1)` do cliente).
 pub trait Record: Sized {
     /// Tamanho em bytes de um registro.
@@ -485,14 +496,6 @@ impl TextPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn encode(body: &[u8]) -> Vec<u8> {
-        let mut file = (body.len() as u32).to_le_bytes().to_vec();
-        file.extend(body.iter().enumerate().map(|(index, byte)| {
-            byte ^ DECODE_KEY[index % DECODE_KEY.len()].wrapping_add(DECODE_SUBKEY)
-        }));
-        file
-    }
 
     #[test]
     fn decode_round_trips_across_key_boundary() {

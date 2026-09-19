@@ -7,7 +7,8 @@ Resultado (a pasta NÃO vai para o git: são arquivos do jogo, ~1,2 GB):
       paks/<Pacote>/...        conteúdo de cada .pak (via `corum-assets extract-all`)
       loose/<Pasta>/...        arquivos soltos de Data (Map, Cdt, Sound, Cursor, Manager)
       manager_decoded/*.bin    tabelas .cdb já decifradas (`corum-assets cdb-decode-all`)
-      resources/*.tsv          id de recurso -> caminho (`.erd` decodificados, `0xID<TAB>caminho`)
+      system/*.tsv             tabelas de jogo editáveis, uma coluna por campo (o "System" à la Lineage 2)
+      resources/*.tsv         id de recurso -> caminho (`.erd` decodificados, `0xID<TAB>caminho`)
       config/...               .erd, .ini e Paklist.sin da raiz do cliente
       manifest.json            arquivo -> origem, tamanho, sha256; contagem por extensão
 
@@ -75,6 +76,10 @@ def main() -> int:
 
     print("tabelas cdb")
     run_quiet(exe, "cdb-decode-all", str(data / "Manager"), str(out / "manager_decoded"))
+
+    print("system (tabelas editáveis em TSV)")
+    system = run(exe, "cdb-export-tsv", str(data / "Manager"), str(out / "system"))
+    print("  " + system.strip().splitlines()[-1])
 
     print("tabelas de recursos (.erd)")
     (out / "resources").mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ use corum_assets::model::ModelFile;
 use corum_assets::motion::MotionFile;
 use corum_assets::pose::{Skeleton, transform_point};
 use corum_assets::stm::StaticModelFile;
+use corum_assets::tables;
 use corum_assets::ttb::TileMap;
 use corum_assets::vcl::VertexColors;
 use corum_assets::{PakArchive, PakError};
@@ -48,6 +49,10 @@ fn run() -> Result<(), String> {
         "pose-check" if arguments.len() == 3 => pose_check(&arguments[1], &arguments[2]),
         "lm-info" if arguments.len() == 3 => lm_info(&arguments[1], &arguments[2]),
         "cdb-info" if arguments.len() == 2 => cdb_info(&arguments[1]),
+        "cdb-export-tsv" if arguments.len() == 3 => cdb_export_tsv(&arguments[1], &arguments[2]),
+        "tsv-to-cdb" if arguments.len() == 4 => {
+            tsv_to_cdb(&arguments[1], &arguments[2], &arguments[3])
+        }
         "erd-dump" if arguments.len() == 2 => erd_dump(&arguments[1]),
         "cdb-decode-all" if arguments.len() == 3 => cdb_decode_all(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
@@ -152,6 +157,52 @@ fn cdb_rows<T: Record>(decoded: &[u8], show: impl Fn(&T) -> String) -> Result<()
     for row in rows.iter().take(10) {
         println!("  {}", show(row));
     }
+    Ok(())
+}
+
+fn cdb_export_tsv(directory: &str, output: &str) -> Result<(), String> {
+    fs::create_dir_all(output).map_err(|error| error.to_string())?;
+    let mut done = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let is_cdb = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cdb"));
+        let Some(schema) = is_cdb.then(|| tables::schema_for(&stem)).flatten() else {
+            continue;
+        };
+        let decoded = cdb::decode(&fs::read(&path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let tsv = schema
+            .to_tsv(&decoded)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let rows = tsv.lines().count() - 1;
+        fs::write(Path::new(output).join(format!("{stem}.tsv")), tsv)
+            .map_err(|error| error.to_string())?;
+        done.push(format!(
+            "{stem} ({rows} rows, {} columns)",
+            schema.columns().len()
+        ));
+    }
+    done.sort();
+    for line in &done {
+        println!("  {line}");
+    }
+    println!("exported {} tables to {output}", done.len());
+    Ok(())
+}
+
+fn tsv_to_cdb(table: &str, tsv_path: &str, cdb_path: &str) -> Result<(), String> {
+    let schema = tables::schema_for(table).ok_or_else(|| format!("no schema for `{table}`"))?;
+    let tsv = fs::read_to_string(tsv_path).map_err(|error| error.to_string())?;
+    let body = schema.from_tsv(&tsv).map_err(|error| error.to_string())?;
+    fs::write(cdb_path, cdb::encode(&body)).map_err(|error| error.to_string())?;
+    println!("wrote {cdb_path} ({} bytes of table data)", body.len());
     Ok(())
 }
 
@@ -612,6 +663,8 @@ fn usage() -> String {
         "  corum-assets anm-info <motion.anm>",
         "  corum-assets ttb-info <map.ttb>",
         "  corum-assets cdb-info <table.cdb>",
+        "  corum-assets cdb-export-tsv <Data/Manager> <output-dir>",
+        "  corum-assets tsv-to-cdb <table-name> <table.tsv> <output.cdb>",
         "  corum-assets erd-dump <resource.erd>",
         "  corum-assets cdb-decode-all <Data/Manager> <output-dir>",
         "  corum-assets map-info <scene.map>",

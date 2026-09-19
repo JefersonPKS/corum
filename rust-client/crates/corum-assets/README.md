@@ -344,8 +344,35 @@ Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo ca
 | `message.cdb`, `Cmd_Message.cdb`, `Emoticon.cdb`, `Filter_*Conv_Message.cdb` | `TextPool` | — | 1.823 / 17 / 40 / 22 | assinatura `Oops`; `u32 (ignorado)`, `Oops`, `contagem`, `tamanho_dos_textos`, `contagem × (id, posição)`, textos NUL-terminados; o cliente indexa pela posição |
 
 - **Idioma [confirmado]:** este cliente traz os textos em **inglês** (`message.cdb`: "Bank", "Occupied Dungeon"…); nomes de NPC como "Takion". Campos fixos são bytes crus (`FixedText`), com decodificação GBK só quando aparecer texto não ASCII.
-- **Ainda sem parser tipado** (a struct está no servidor ou não foi localizada): `ItemWeapon`, `ItemArmor`, `ItemConsumable`, `ItemSpecial`, `ItemSupplies`, `ItemMaterials`, `ItemEdition`, `Itemtalisman`, `ItemGuardian`, `ItemSetInfo`, `ItemAttrDefine`, `ItemUpgrade` (o cliente os recebe do servidor/`CBaseItem`), `Skill`/`SkillEffect` (`Skill.cdb` = `SkillEffect.cdb`, 202.176 B; começa com `u16 id`, `u16`…, nome de 32 B), `questlist` (226.502 B), `questnpc` (3.006 B), `questtitle` (2.052 B), `Interface*Info`, `KeyInfo`, `Hairshopoption`, `EventDungeonDescription`, `GroupInfo`, `Level`-like menores. Os cabeçalhos das tabelas de item começam com `u16 id` + nome (`Short Sword`, `Cap`, `Experience x2 (under lev 70)`).
+- **Tabelas de item, habilidades e o resto** já têm esquema (ver a seção do "System" editável abaixo); ficam sem decifrar `questlist`, `questnpc`, `questtitle`, `Interface*Info`, `Hairshopoption`, `EventDungeonDescription` e os `.cdt`.
 - **CLI:** `cdb-info <arquivo.cdb>` mostra o tipo/contagem e os 10 primeiros registros; `cdb-decode-all <Data\Manager> <saida>` grava os 55 corpos decifrados como `.bin`, para inspecionar as tabelas ainda sem parser.
+
+## O "System" editável: esquemas e TSV (módulos `schema` e `tables`, 2026-09-19)
+
+Como a pasta `System` do Lineage 2 (`itemname`, `weapongrp`, `armorgrp`, `skillgrp`…): cada tabela `.cdb` decifrada vira um **TSV com cabeçalho e uma coluna por campo**, editável em planilha, e volta a `.cdb` idêntico.
+
+- **Esquema (`schema::Schema`):** lista de colunas nomeadas e tipadas (`u8/u16/u32/u64/i16/i32`, texto de tamanho fixo, bytes em hexadecimal para o que ainda não foi decifrado). Grupos repetidos viram `set_option1_kind`, `level12_max`… A mesma definição serve para ler bytes, escrever TSV e fazer o caminho de volta.
+- **Definições (`tables::schema_for`):** 40 arquivos, seguindo `CommonServer/BaseItem.h` (itens), `CorumOnlineProject/Effect.h` (`BASESKILL`), `struct.h` e `LoginAgent/ItemManager.h`. Cada tamanho de registro foi conferido contra o arquivo do cliente instalado.
+- **Ida e volta [confirmado]:** o teste `every_real_table_round_trips_through_tsv` (com `CORUM_DATA`) faz `.cdb` → TSV → `.cdb` nas 40 tabelas e exige bytes **idênticos** ao original.
+- **Texto:** bytes crus (o cliente é GBK); no TSV cada byte vira um caractere Latin-1, o que é idêntico ao ASCII e sem perdas para o resto. `\t`, `\n`, `\r` e `\` são escapados. Um texto maior que o campo é rejeitado.
+- **Regras de edição:** não mudar nome nem ordem das colunas; o número de linhas pode variar. Os ids não são validados (um id repetido ou fora de faixa passa).
+
+| Tabela (arquivo) | Linhas | Colunas | Conteúdo |
+|---|---|---|---|
+| `ItemWeapon` | 554 | 63 | arma: tipo, mão, grau, nível mínimo, dano, velocidade, alcance, 6 opções de set, 4 opções de parte, preço |
+| `ItemArmor` | 1.246 | 57 | armadura (mesma estrutura, sem mão/mana/destreza) |
+| `ItemSpecial`, `ItemConsumable`, `ItemSupplies`, `ItemZodiac`, `ItemRide`, `ItemGuardian`, `ItemMagicArray`, `ItemMaterials`, `ItemMixUpgrade`, `ItemMagicFieldArray`, `ItemUpgrade`, `ItemLiquid`, `ItemEdition`, `ItemBag` | 219 / 167 / 124 / 35 / 1 / 66 / 23 / 211 / 16 / 26 / 22 / 14 / 173 / 15 | 14–39 | um tipo de item cada; todos começam com `id`, `name_kor`, `name_eng`, `code_id`, `code_type`, `rand_item`, `movable` |
+| `ItemSetInfo` | 92 | 47 | sets de equipamento e bônus |
+| `ItemAttrDefine`, `ItemAttrValueList` | 321 / 476 | 7 / 5 | descrição e faixas de valor dos atributos de item |
+| `Skill` (= `SkillEffect`) | 117 | 346 | habilidades: nome, descrição, alvo, alcance, tempos e 51 níveis (`levelN_min/max/mana/compass/duration/probability`) |
+| `SkillResource`, `itemresource`, `itemstore`, `itemoption` | 110 / 3.058 / 1.660 / 1.117 | 9 / 9 / 3 / 10 | ícones, modelos, lojas e textos de opção |
+| `npctable`, `CPTable`, `Level`, `GuardianLevel`, `BaseClassInfo`, `Help`, `KeyInfo`, `GroupInfo`, `ItemMaking`, `Itemtalisman`… | — | — | NPCs, CP, níveis, ajuda, teclas, grupos, receitas |
+
+- **Diferenças entre o código-fonte (2005) e o cliente (2007) [hipótese quanto ao significado]:** `ItemConsumable` tem 3 bytes a mais que `BASEITEM_CONSUMABLE` (um `u16` entre `min_lev` e `max_lev`, sempre 0, e um `u8` final de 0 ou 1: colunas `unknown_min_lev_2` e `unknown_tail`); `ItemBag` tem 4 bytes a mais no fim (`unknown_tail`, sempre 0); `ItemAttrDefine` tem 111 B (texto de 100 B + `unknown_flag`); `Level.cdb` tem 9 B por nível (o `SLEVEL_EXP` do código-fonte, 5 B, vale só para `GuardianLevel`). `Itemtalisman` não tem struct no código-fonte: só o cabeçalho de item foi separado e os 162 B seguintes ficam em `unknown_body` (hex).
+- **Conferência de sentido:** "Marbes' Death Fist" pede nível 192 e dá dano 59–110; "Vaselin's Cross Shower" custa 218.412 (venda 70.353); "Mana Mastery" é passiva (`type=3`) da propriedade 500, como comentam as structs. `ItemWeapon` 327 de 554 armas não pedem nível.
+- **Como usar:** `corum-assets cdb-export-tsv <Data/Manager> <pasta>` gera os TSV; depois de editar, `corum-assets tsv-to-cdb <Tabela> <arquivo.tsv> <saida.cdb>` gera o `.cdb` cifrado (verificado: trocar "Short Sword" por "Espada Curta" e reexportar altera só essa linha; o arquivo mantém o tamanho, 110.250 B). Isso permite um mod do cliente original **e** um cliente Rust que leia os TSV direto.
+- **Limite:** o servidor é quem manda nas regras (dano, preço, drop); editar o cliente só muda o que aparece.
+- **Ainda sem esquema:** `questlist`, `questnpc`, `questtitle`, `Interface*Info`, `Hairshopoption`, `EventDungeonDescription`, os `.cdt` (219) e os pools de texto `Oops` (que já têm `cdb::TextPool`, sem TSV ainda).
 
 ## Tabelas de recursos `.erd` (módulo `erd`, 2026-09-19)
 
@@ -358,13 +385,14 @@ Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo ca
 
 ## Exportação completa para montar o cliente
 
-`tools/export_client_data.py <cliente> <saida>` reúne tudo numa pasta (12.667 arquivos, 1,28 GB em 54 s, **fora do git**: `rust-client/export/` está no `.gitignore`):
+`tools/export_client_data.py <cliente> <saida>` reúne tudo numa pasta (12.707 arquivos, 1,28 GB em 54 s, **fora do git**: `rust-client/export/` está no `.gitignore`):
 
 | Pasta | Conteúdo |
 |---|---|
 | `paks/<Pacote>/` | conteúdo dos 13 `.pak` (`.dds` 3.441, `.mod` 2.158, `.anm` 1.819, `.chr` 1.498, `.tif` 683, `.tga` 342, `.vcl` 206, `.lm` 204…) |
 | `loose/` | soltos de `Data`: `Map` (202 `.ttb`, 5 `.map`…), `Cdt` (219), `Sound` (1.054 `.wav`, 31 `.mp3`), `Cursor`, `Manager` |
 | `manager_decoded/` | os 55 `.cdb` decifrados (`.bin`) |
+| `system/` | 40 tabelas em TSV editável (`ItemWeapon.tsv`, `Skill.tsv`…), ver "System" editável |
 | `resources/` | os dois `.erd` como `0xID<TAB>caminho` |
 | `config/` | `.erd`, `.ini`, `Paklist.sin` |
 | `manifest.json` | por arquivo: tamanho e sha256; contagem por extensão e por pasta |
@@ -395,6 +423,8 @@ cargo run -p corum-assets -- lm-info  "D:\Games\CorumOnline\Data\Map\1100.lm"  "
 # tabelas de jogo (Manager)
 cargo run -p corum-assets -- cdb-info "D:\Games\CorumOnline\Data\Manager\npctable.cdb"
 cargo run -p corum-assets -- cdb-decode-all "D:\Games\CorumOnline\Data\Manager" .\target\verification\cdb
+cargo run -p corum-assets -- cdb-export-tsv "D:\Games\CorumOnline\Data\Manager" .\export\system
+cargo run -p corum-assets -- tsv-to-cdb ItemWeapon .\export\system\ItemWeapon.tsv .\ItemWeapon.cdb
 cargo run -p corum-assets -- erd-dump "D:\Games\CorumOnline\CorumResource.erd"
 
 # exporta tudo para uma pasta só (paks + soltos + cdb decifrados + erd + manifesto; fora do git)

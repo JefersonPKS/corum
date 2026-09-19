@@ -19,6 +19,7 @@ Legenda de certeza: **[confirmado]** medido nos arquivos ou visto na tela; **[hi
 | Texturas do cenário (51 únicas, DXT1, `Map_dds.pak`) | **[confirmado]** aplicadas, com mipmaps e alpha-test |
 | Colisão TTB, personagem e mob de teste (caixas) | funcionando |
 | Outros mapas | 196 mapas passam nos parsers; texturas DDS e TIFF resolvem; verificado na tela em 4 mapas |
+| Objetos posicionados | árvores, casas, cercas e ruínas aparecem nos mapas (A4); faltam efeitos aditivos (fogo) |
 | Luz | Iluminação assada completa no `1100`: VCL (tipo 1) e lightmaps (tipo 3), em espaço gamma; luzes pontuais só em personagem e mob (B1–B4 prontos) |
 | Céu, névoa, água, objetos posicionados, mobs e personagem reais | ausentes |
 
@@ -33,9 +34,10 @@ Objetivo: qualquer mapa do cliente abre sem erro e mostra toda a geometria e os 
 | A1 ✅ | Rodar os parsers e o sandbox nos demais mapas | Feito com `tools/survey_maps.py` nos 196 mapas empacotados: 0 erros de parse, `.vcl` exato em 195, `.lm` sem divergência em 196, `.map` lido em 196. Achados: o tipo 0 (10.700 objetos) não era desenhado nem contado no VCL; o campo de tipo usa os bytes altos; nomes curtos eram rejeitados. Verificado na tela em `1100`, `5`, `101` e `750`. **Aberto:** o mapa `1` (ver README do `corum-assets`) | Cumprido, com o mapa `1` como exceção documentada |
 | A2 ✅ | Parser de STM que não perde objetos em silêncio | Feito: regra estrutural dos contadores no lugar do tamanho do nome, ressincronização e `unread_object_offsets` (mostrado por `stm-info`) | Cumprido: 0 objetos não lidos nos 196 mapas |
 | A3 | Normais por vértice do STM | Tipo 1 tem `V × [f32;3]` após 16 bytes **[hipótese: normais]**. Validar renderizando e comparando com a normal da face | Superfícies curvas sem facetas |
-| A4 | `GX_OBJECT`: ler `.MOD` (estático) e `.CHR` (animado) posicionados (o `.map` já traz a lista) | O parser de MAP já lê posição, escala, eixo e ângulo. Falta instanciar o modelo. Só funciona para malhas estáticas até a Fase C1 | `RD_BONFIRE.CHR` e `village_*.MOD` aparecem nos mapas que os usam |
+| A4 ✅ | `GX_OBJECT`: `.MOD` e `.CHR` posicionados | Feito: 10.282 objetos em 158 mapas (só 36 sem arquivo), agrupados por modelo, texturizados e com escala negativa/não uniforme; `5`, `604` e `750` conferidos na tela. Descobertas pelo caminho: o `material` dos grupos do `.MOD` é um **seletor**, não um índice; a extensão pedida pelo material decide entre `.dds` e `.tif` (existem imagens diferentes com o mesmo nome); os TIFF são usados invertidos (origem embaixo). **Aberto:** o sentido do ângulo não foi verificado contra o cliente original, o significado das `flags` é desconhecido e chamas/tochas precisam de mistura aditiva | Cumprido, com o aditivo em A10 |
 | A5 | Céu/fundo e névoa | Descobrir de onde vem a cor de fundo (pode estar em `.cdb`/`.cdt` ou no executável). Fase B5 cobre a névoa | Fundo deixa de ser azul sólido |
 | A6 | Água e transparência | Texturas TIFF/DDS de água têm alfa de 90 a 210 (medido) e hoje perdem os pixels abaixo de 50% no *alpha test*. Requer uma passada com blending (ordenada de trás para frente) e possivelmente animação por UV; objetos tipo 0 (`ALP`) e `type_flags` podem indicar quais são translúcidos **[hipótese]** | Água semi-transparente, sem buracos |
+| A10 | Efeitos aditivos (fogo, tochas, brilhos) | Hoje aparecem como quadrados pretos: os `.CHR` de fogo usam texturas para mistura aditiva. Requer uma passada com `blend = one + one` e sem escrita de profundidade, e provavelmente animação por UV/quadros; as `flags` do objeto e do material podem indicar quais **[hipótese]** | Chamas visíveis, sem quadrado preto |
 | A8 | Billboards (tipo 48) | 153 objetos, 4 vértices cada, nomes ` BILLBOARD*`. Placas que giram para a câmera (efeitos, chamas). Hoje são lidas e não desenhadas | Placa visível e voltada para a câmera |
 | A9 | Mapa `1` | 98.055 vértices tipo 0 contra 87.063 cores VCL; 257 lightmaps para 1 objeto tipo 3. Investigar o layout diferente antes de aceitar o mapa | `vcl-info` e `lm-info` sem divergência |
 | A7 | Sanidade de alinhamento TTB↔STM | Hoje ambos usam origem 0 e escala `1/tile_size`; visualmente o personagem fica no chão da área jogável **[confirmado no 1100]**. Repetir em outros mapas com `G` (grade) ligada | Grade TTB coincide com o piso em 3+ mapas |
@@ -89,7 +91,7 @@ Há três trilhas que quase não dependem uma da outra:
 | Formatos de modelo (C1–C3) | Geometria já decifrada; falta a pose, os pesos e a animação | mobs e personagem animados |
 | Dados de jogo (C5) e protocolo (Marcos 1–2 do plano) | Parser de CDB; login por CLI | integração com servidor |
 
-Recomendação: a iluminação assada (B1–B4, A1, A2) e os modelos parados e texturizados (C0, C1) estão prontos. Seguir com **A4** (objetos posicionados nos mapas, com ~99% dos `.MOD` de `Map_chr`), com o **skinning e a animação** (decifrar a cauda do `F4`, as tracks do `.ANM`, C2–C4) e com o **C5** (tabelas CDB: qual modelo é qual monstro/personagem).
+Recomendação: a iluminação assada (B1–B4, A1, A2), os modelos parados e texturizados (C0, C1) e os objetos posicionados (A4) estão prontos. Seguir com os **efeitos aditivos** (A10) e a **água translúcida** (A6), com o **skinning e a animação** (decifrar a cauda do `F4`, as tracks do `.ANM`, C2–C4) e com o **C5** (tabelas CDB: qual modelo é qual monstro/personagem).
 
 ## Riscos e decisões pendentes
 

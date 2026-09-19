@@ -226,6 +226,20 @@ impl ModelFile {
         })
     }
 
+    /// Index into [`materials`](Self::materials) that a face group's `material` value names.
+    ///
+    /// The value is **not** an index: it is the material's selector. The first material has no
+    /// selector and answers to `1`; the others carry selectors counting down (a model with
+    /// materials `[None, 7, 6, 5, 4, 3, 2]` has groups numbered `7..=1`). Returns `None` for a
+    /// value no material answers to.
+    #[must_use]
+    pub fn material_index_for_group(&self, group_material: u32) -> Option<usize> {
+        self.materials
+            .iter()
+            .position(|material| material.selector == Some(group_material))
+            .or_else(|| (group_material == 1 && !self.materials.is_empty()).then_some(0))
+    }
+
     pub fn to_obj(&self) -> Result<String, ModelError> {
         let mut output = String::from("# Corum Online MOD export\n");
         let mut base_vertex = 1_u32;
@@ -657,6 +671,38 @@ mod geometry_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_with_selectors(selectors: &[Option<u32>]) -> ModelFile {
+        ModelFile {
+            version: 1,
+            node_count: 0,
+            material_count: selectors.len() as u32,
+            bone_count: 0,
+            materials: selectors
+                .iter()
+                .map(|selector| ModelMaterial {
+                    selector: *selector,
+                    flags: 0,
+                    texture_name: String::new(),
+                    name: String::new(),
+                })
+                .collect(),
+            meshes: Vec::new(),
+            bones: Vec::new(),
+            unsupported_records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn group_material_values_are_selectors_not_indices() {
+        let model = model_with_selectors(&[None, Some(7), Some(6), Some(2)]);
+        assert_eq!(model.material_index_for_group(1), Some(0));
+        assert_eq!(model.material_index_for_group(7), Some(1));
+        assert_eq!(model.material_index_for_group(6), Some(2));
+        assert_eq!(model.material_index_for_group(2), Some(3));
+        assert_eq!(model.material_index_for_group(3), None);
+        assert_eq!(model_with_selectors(&[]).material_index_for_group(1), None);
+    }
 
     #[test]
     fn obj_name_replaces_spaces() {

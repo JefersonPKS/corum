@@ -81,7 +81,9 @@ Depois do cabeçalho de `0x174` bytes do payload `F4`, com `V` vértices, `T` UV
 | grupos de faces | variável, **sem contagem** | grupos consecutivos, lidos enquanto o padrão vale |
 | resto | variável | ainda não decodificado (ver abaixo) |
 
-Um grupo tem o **mesmo cabeçalho do STM**: 28 bytes `material, x, faces, faces, 0, ?, 0`, seguidos de `faces` triângulos com três `u16` cada, **sem preenchimento** (o alinhamento a 4 bytes foi testado em ~2.100 malhas e a leitura sem padding é igual ou melhor em todas). `material` indexa a tabela de materiais do modelo; o significado de `x` é desconhecido.
+Um grupo tem o **mesmo cabeçalho do STM**: 28 bytes `material, x, faces, faces, 0, ?, 0`, seguidos de `faces` triângulos com três `u16` cada, **sem preenchimento** (o alinhamento a 4 bytes foi testado em ~2.100 malhas e a leitura sem padding é igual ou melhor em todas). O significado de `x` é desconhecido.
+
+**O campo `material` de um grupo não é um índice, é o _seletor_ do material.** O primeiro material do modelo não tem seletor e responde ao valor `1`; os demais têm seletores em ordem decrescente. Exemplos medidos: o farol tem materiais `[None, 10, 9, …, 2]` e grupos numerados `10..1`; o NPC `npc007`, `[None, 7, 6, 5, 4, 3, 2]` e grupos `7..1`; o pinheiro `ks-m2tree`, `[None, 2]` e grupos `2, 1`. `ModelFile::material_index_for_group` faz a tradução. Ler o valor como índice de 0 passa despercebido quando todos os materiais usam a mesma textura (os NPCs), mas deixa grupos sem textura em modelos como a grama e as árvores de `Map_chr`.
 
 **Como foi descoberto:** a relação `T + S = V` apareceu num farol estático de `Map_chr.pak` (`lighthouse-blue`). O mapa de blocos do payload (2.040 bytes de floats = 170 × 12, `V × 12` de floats, 3 registros por grupo) e a regra de que o prefixo depois dos UVs de costura tem exatamente `S` palavras vieram da varredura de ~2.100 malhas; a leitura dos grupos foi validada no `Object01` (16 vértices), onde os materiais 9, 8, 7 e 6 e os triângulos `(5,9,10),(10,11,5)` aparecem exatamente como esperado. Um parser antigo assumia "contagem de grupos + cabeçalho de 24 bytes" e só cobria 5% das malhas: a "contagem" era, na verdade, o primeiro campo de um cabeçalho de grupo.
 
@@ -126,6 +128,12 @@ As três semânticas finais ainda serão confirmadas contra o motor, mas a divis
 
 Cobertura medida nos 196 mapas empacotados (7.921 materiais): 7.628 em `Map_dds.pak`, 287 em `Map_tif.pak` e 6 sem textura (4 com nome vazio e `wall_9_skell.tga`). Um `thumbs.db` perdido dentro de `Map_tif.pak` é ignorado. `Map_tif.pak` também guarda alguns `.vcl` e `.lm` (ex.: `1206`).
 
+### Nomes de textura dos modelos e orientação dos TIFF
+
+- A extensão pedida pelo material vale: `KS-tree02.tif` pede o TIFF, enquanto materiais `.tga` estão nos pacotes como `.dds`. Isso importa porque o mesmo nome pode existir nos dois formatos com **imagens diferentes** (`ks-tree02.dds` em `Map_dds.pak` e `ks-tree02.tif` em `Map_tif.pak`). O `Paklist.sin` só lista os pacotes (`Character, DamageNumber, Effect, Item, Map_chr, Map_dds, Map_light, Map_stm, Map_tga, Map_tif, Monster, Npc, UI`) e não decide a prioridade.
+- **Os TIFF são armazenados de cima para baixo mas amostrados com `v = 0` embaixo**, como TGA (nenhum tem a tag de orientação). O sinal veio do tronco de `ks-m2tree`, cujos UVs (`v` de 0,05 a 0,26, com `u` repetido) só caem na tira de casca se a base do arquivo for `v = 0`. Quem usa `from_tiff` deve inverter as linhas (o sandbox faz isso). DDS não precisa. Isso vale para os TIFF usados por modelos; para os materiais TIFF dos STM (`Map_tif.pak`) a inversão é a mesma convenção, mas não foi verificada em um caso assimétrico.
+- O 4º canal dos TIFF (tag `ExtraSamples = 0`, "não especificado") é de fato o alfa: as silhuetas de galhos e copas são recortes corretos.
+
 ## Formatos de mapa
 
 Um mapa `N` é composto por arquivos em `Data\Map` (soltos ou dentro de `Map_stm.pak`, `Map_light.pak` etc.):
@@ -140,6 +148,15 @@ Um mapa `N` é composto por arquivos em `Data\Map` (soltos ou dentro de `Map_stm
 | `N.lfg`, `N.ofg`, `N.hfl`, `N.am2`, `N.vch` | luzes/efeitos/altura/outros | não investigados |
 
 Tudo é little-endian. Nomes de objetos e materiais estão em code page legada (CP949): o parser usa `from_utf8_lossy`, então nomes coreanos saem com `�`. Isso é inofensivo para o desenho, mas não use esses nomes como chave estável.
+
+### Objetos posicionados (`GX_OBJECT`)
+
+Levantamento: **10.282 objetos em 158 mapas** (197 mapas têm o bloco, 39 com ele vazio) (7.389 `.MOD` e 2.893 `.CHR`). O maior é o `1` (746 objetos), depois `604` (713), `1308` (584) e `10001` (555). Os recursos estão em `Map_chr.pak`; só 36 objetos (`wobj0001` a `wobj0004.mod`) não têm arquivo.
+
+- **`.CHR`** é um manifesto (`*MOD_FILE_NAME` + animações): o objeto é o modelo apontado, animado por um `.ANM`; o sandbox o desenha na pose de bind.
+- **Transformação:** `escala (x y z)`, `posição (x y z)`, `eixo (x y z)` e `ângulo` em radianos. O eixo é **sempre `(0, 1, 0)`** nos 10.282 objetos; a posição está nas unidades do STM (o sandbox usa a mesma conversão do cenário, `x * escala - largura / 2`); o ângulo vai de −10 a 7,4 e a escala de −3,4 a 3,6, com **escala negativa (espelhamento) e não uniforme** em 118 objetos.
+- **Sentido do ângulo:** o script parece guardar uma rotação do Direct3D (mão esquerda). O sandbox aplica `-ângulo` na rotação de mão direita do glam e o resultado parece coerente (casas, cercas e ruínas alinhadas com o terreno), mas **não foi verificado contra o cliente original**.
+- **`flags`** (`1000002` em 5.482 objetos, `1000008` em 2.075, `0` em 1.095, `100000A` em 821, `4`, `1000006`, `100000E`, `8`): significado desconhecido.
 
 ### TTB
 

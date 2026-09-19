@@ -107,6 +107,20 @@ Texturas e iluminação são procuradas, nesta ordem: na pasta de dados do jogo 
 
 Verificados na tela: `1100` (masmorra escura com poças de luz coloridas), `5` (vila, com sombras assadas no chão), `101` (masmorra com 141 luzes) e `750` (templo flutuante). Nos três últimos todos os materiais receberam textura.
 
+### Objetos do mapa (`GX_OBJECT`)
+
+Os objetos listados no `.map` (árvores, casas, cercas, barris, ruínas, fogueiras) são
+desenhados a partir de `Map_chr.pak`: os `.MOD` direto e os `.CHR` pelo modelo que o
+manifesto aponta (pose de bind, sem animação). Cada modelo único vira um lote com as instâncias
+já em coordenadas de mundo (escala, rotação Y e posição do script), com as suas texturas
+(`Map_chr`, depois `Map_dds` e `Map_tif`). Como os atores, recebem o ambiente e as luzes
+pontuais, e não têm cor assada. A tecla `O` mostra ou oculta os objetos. O sandbox imprime
+`placed N of M map objects`.
+
+Verificados na tela: `5` (vila: 43 objetos, casas, pinheiros e arbustos), `604` (savana com
+ilhas: 713 objetos em 10 modelos) e `750` (2 objetos). **Ainda não desenhados corretamente:**
+chamas e tochas (`.CHR` de fogo) aparecem como quadrados pretos, porque falta a mistura aditiva.
+
 ### Personagem e mob reais
 
 O personagem controlável e o mob em patrulha são modelos `.MOD` reais e texturizados, na

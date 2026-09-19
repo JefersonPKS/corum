@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::ops::Range;
@@ -9,9 +10,10 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use corum_assets::PakArchive;
+use corum_assets::chr::ChrManifest;
 use corum_assets::dds::DecodedImage;
 use corum_assets::lightmap::LightmapFile;
-use corum_assets::map_script::{MapLight, MapScript};
+use corum_assets::map_script::{MapLight, MapObject, MapScript};
 use corum_assets::model::ModelFile;
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
@@ -82,6 +84,7 @@ fn run() -> Result<(), String> {
         baked.as_ref(),
         &lights,
     )?;
+    scene.props = load_props(&path, &scene.map);
     scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
@@ -242,7 +245,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         format!(
-            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho",
+            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("map.ttb"),
@@ -362,6 +365,8 @@ struct SandboxScene {
     show_collision: bool,
     show_entities: bool,
     show_point_lights: bool,
+    props: Vec<PropBatch>,
+    show_props: bool,
     player_model: Option<ActorModel>,
     mob_model: Option<ActorModel>,
     player_yaw: f32,
@@ -423,6 +428,8 @@ impl SandboxScene {
             show_collision: false,
             show_entities: true,
             show_point_lights: true,
+            props: Vec::new(),
+            show_props: true,
             player_model: None,
             mob_model: None,
             player_yaw: 0.0,
@@ -448,6 +455,7 @@ impl SandboxScene {
             KeyCode::KeyG if pressed => self.show_collision = !self.show_collision,
             KeyCode::KeyH if pressed => self.show_entities = !self.show_entities,
             KeyCode::KeyL if pressed => self.show_point_lights = !self.show_point_lights,
+            KeyCode::KeyO if pressed => self.show_props = !self.show_props,
             KeyCode::KeyB if pressed => {
                 self.baked_gain = if self.baked_gain > 1.5 { 1.0 } else { 2.0 };
             }
@@ -1193,6 +1201,7 @@ struct Renderer {
     pipeline: wgpu::RenderPipeline,
     texture_bind_group: wgpu::BindGroup,
     actors: Vec<ActorGpu>,
+    props: Vec<PropGpu>,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
     vertex_count: u32,
@@ -1356,6 +1365,23 @@ impl Renderer {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         let depth = DepthTarget::new(&device, width, height);
+        let props: Vec<PropGpu> = scene
+            .props
+            .iter()
+            .map(|batch| {
+                let (_layout, bind_group) = batch.textures.upload(&device, &queue);
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sandbox prop vertices"),
+                    contents: bytemuck::cast_slice(&batch.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                PropGpu {
+                    bind_group,
+                    buffer,
+                    count: batch.vertices.len() as u32,
+                }
+            })
+            .collect();
         let mut actors = Vec::new();
         for (kind, model) in [
             (ActorKind::Player, &scene.player_model),
@@ -1388,6 +1414,7 @@ impl Renderer {
             pipeline,
             texture_bind_group,
             actors,
+            props,
             vertex_buffer,
             vertex_capacity,
             vertex_count: vertices.len() as u32,
@@ -1523,6 +1550,13 @@ impl Renderer {
             pass.set_bind_group(1, &self.texture_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
+            if self.scene.show_props {
+                for prop in &self.props {
+                    pass.set_bind_group(1, &prop.bind_group, &[]);
+                    pass.set_vertex_buffer(0, prop.buffer.slice(..));
+                    pass.draw(0..prop.count, 0..1);
+                }
+            }
             for actor in self.actors.iter().filter(|actor| actor.count > 0) {
                 pass.set_bind_group(1, &actor.bind_group, &[]);
                 pass.set_vertex_buffer(0, actor.buffer.slice(..));
@@ -1585,18 +1619,32 @@ impl ActorModel {
         let bytes = archive
             .read_entry(entry)
             .map_err(|error| error.to_string())?;
-        let model = ModelFile::parse(&bytes).map_err(|error| error.to_string())?;
         // The textures of a model live in its own package (`.dds`, sometimes `.tif`).
         let packages = TexturePackages {
-            dds: Some(archive.clone()),
-            tif: Some(archive),
+            dds: vec![archive.clone()],
+            tif: vec![archive],
         };
+        let model = Self::from_bytes(&bytes, &packages, tile_size)?;
+        eprintln!(
+            "loaded actor {package}/{entry}: {} triangles",
+            model.vertices.len() / 3
+        );
+        Ok(model)
+    }
+
+    /// Builds the model from `.MOD` bytes, resolving its textures from `packages`.
+    fn from_bytes(
+        bytes: &[u8],
+        packages: &TexturePackages,
+        tile_size: f32,
+    ) -> Result<Self, String> {
+        let model = ModelFile::parse(bytes).map_err(|error| error.to_string())?;
         let names: Vec<String> = model
             .materials
             .iter()
             .map(|material| material.texture_name.clone())
             .collect();
-        let textures = MapTextures::from_names(&names, &packages);
+        let textures = MapTextures::from_names(&names, packages);
 
         let scale = 1.0 / tile_size;
         let mut vertices = Vec::new();
@@ -1622,11 +1670,13 @@ impl ActorModel {
                 normals[c] += normal;
             }
             for group in &geometry.face_groups {
-                let layer = textures.layer_for_material(group.material_index);
-                let color = match (layer, model.materials.get(group.material_index as usize)) {
+                // The group's `material` is a selector, not an index (see the assets README).
+                let material = model.material_index_for_group(group.material_index);
+                let layer = material.and_then(|index| textures.layer_for_material(index as u32));
+                let color = match (layer, material) {
                     (Some(_), _) => [1.0; 3],
-                    (None, Some(material)) => {
-                        material_color(&material.texture_name, group.material_index)
+                    (None, Some(index)) => {
+                        material_color(&model.materials[index].texture_name, group.material_index)
                     }
                     (None, None) => material_color("missing", group.material_index),
                 };
@@ -1656,12 +1706,130 @@ impl ActorModel {
         if vertices.is_empty() {
             return Err("the model has no decodable mesh".to_owned());
         }
-        eprintln!(
-            "loaded actor {package}/{entry}: {} triangles",
-            vertices.len() / 3
-        );
         Ok(Self { vertices, textures })
     }
+}
+
+/// One model the map script places many times, with every instance already in world space.
+struct PropBatch {
+    vertices: Vec<Vertex>,
+    textures: MapTextures,
+}
+
+/// Direction of the `GX_OBJECT` rotation. The script angle is a Direct3D (left-handed) rotation
+/// about Y; the world is drawn with the raw coordinates, so glam's right-handed rotation needs
+/// the opposite sign to keep props aligned with the STM scenery.
+const PROP_ROTATION_SIGN: f32 = -1.0;
+
+/// Places the objects listed by the `.map` script (`GX_OBJECT`): `.MOD` models and `.CHR`
+/// manifests (animated props, drawn in bind pose). Models come from `Map_chr.pak`.
+fn load_props(ttb_path: &Path, map: &TileMap) -> Vec<PropBatch> {
+    let Ok(bytes) = fs::read(ttb_path.with_extension("map")) else {
+        return Vec::new();
+    };
+    let Ok(script) = MapScript::parse(&bytes) else {
+        return Vec::new();
+    };
+    if script.objects.is_empty() {
+        return Vec::new();
+    }
+    let archive = match open_data_package(ttb_path, "Map_chr") {
+        Ok(archive) => archive,
+        Err(error) => {
+            eprintln!("props unavailable: {error}");
+            return Vec::new();
+        }
+    };
+    // Prop textures are mostly in Map_chr itself; a few live with the map textures.
+    let mut packages = TexturePackages {
+        dds: vec![archive.clone()],
+        tif: vec![archive.clone()],
+    };
+    packages.dds.extend(open_data_package(ttb_path, "Map_dds"));
+    packages.tif.extend(open_data_package(ttb_path, "Map_tif"));
+
+    let mut by_resource: BTreeMap<String, Vec<&MapObject>> = BTreeMap::new();
+    for object in &script.objects {
+        by_resource
+            .entry(object.resource.to_ascii_lowercase())
+            .or_default()
+            .push(object);
+    }
+
+    let tile_size = map.tile_size as f32;
+    let (mut placed, mut unresolved, mut broken) = (0_usize, 0_usize, 0_usize);
+    let mut batches = Vec::new();
+    for (resource, instances) in &by_resource {
+        // A `.CHR` is a manifest that names the model and its animations.
+        let model_name = if resource.ends_with(".chr") {
+            archive
+                .read_entry(resource)
+                .ok()
+                .and_then(|bytes| ChrManifest::parse(&bytes).ok())
+                .map(|manifest| manifest.model_file)
+        } else {
+            Some(resource.clone())
+        };
+        let Some(bytes) = model_name.and_then(|name| archive.read_entry(&name).ok()) else {
+            unresolved += instances.len();
+            continue;
+        };
+        let model = match ActorModel::from_bytes(&bytes, &packages, tile_size) {
+            Ok(model) => model,
+            Err(_) => {
+                broken += instances.len();
+                continue;
+            }
+        };
+        let mut vertices = Vec::with_capacity(model.vertices.len() * instances.len());
+        for object in instances {
+            placed += 1;
+            append_instance(&mut vertices, &model.vertices, object, map);
+        }
+        batches.push(PropBatch {
+            vertices,
+            textures: model.textures,
+        });
+    }
+    eprintln!(
+        "placed {placed} of {} map objects ({} models; {unresolved} without a model file, {broken} undecodable)",
+        script.objects.len(),
+        batches.len()
+    );
+    batches
+}
+
+/// Appends one instance of `local` (tile units, origin at the model origin) to `output`, applying
+/// the object's scale, rotation and position. Negative scales mirror the model; the winding
+/// flips with them, which does not matter because nothing is culled.
+fn append_instance(output: &mut Vec<Vertex>, local: &[Vertex], object: &MapObject, map: &TileMap) {
+    let scale = Vec3::from_array(object.scale);
+    let axis = Vec3::from_array(object.axis).normalize_or(Vec3::Y);
+    if !scale.is_finite() || !object.angle_radians.is_finite() {
+        return;
+    }
+    let rotation = glam::Quat::from_axis_angle(axis, PROP_ROTATION_SIGN * object.angle_radians);
+    let units = 1.0 / map.tile_size as f32;
+    let translation = Vec3::new(
+        object.position[0] * units - map.width as f32 * 0.5,
+        object.position[1] * units,
+        object.position[2] * units - map.height as f32 * 0.5,
+    );
+    // Normals transform with the inverse scale, then rotate.
+    let inverse_scale = Vec3::new(
+        1.0 / scale.x.abs().max(1e-4) * scale.x.signum(),
+        1.0 / scale.y.abs().max(1e-4) * scale.y.signum(),
+        1.0 / scale.z.abs().max(1e-4) * scale.z.signum(),
+    );
+    output.extend(local.iter().map(|vertex| {
+        let mut placed = *vertex;
+        placed.position =
+            (rotation * (Vec3::from_array(vertex.position) * scale) + translation).to_array();
+        placed.normal = (rotation * (Vec3::from_array(vertex.normal) * inverse_scale))
+            .normalize_or(Vec3::Y)
+            .to_array();
+        placed
+    }));
 }
 
 /// GPU side of an [`ActorModel`]: its own texture array and a vertex buffer rewritten each frame.
@@ -1672,10 +1840,17 @@ struct ActorGpu {
     count: u32,
 }
 
+/// GPU side of a [`PropBatch`]: static, uploaded once.
+struct PropGpu {
+    bind_group: wgpu::BindGroup,
+    buffer: wgpu::Buffer,
+    count: u32,
+}
+
 /// The texture packages a map can draw from.
 struct TexturePackages {
-    dds: Option<PakArchive>,
-    tif: Option<PakArchive>,
+    dds: Vec<PakArchive>,
+    tif: Vec<PakArchive>,
 }
 
 /// Map textures resolved from the `Map_dds` and `Map_tif` packages, one array layer per texture.
@@ -1698,10 +1873,12 @@ impl MapTextures {
         let packages = TexturePackages {
             dds: open_data_package(ttb_path, "Map_dds")
                 .map_err(|error| eprintln!("DDS textures unavailable: {error}"))
-                .ok(),
+                .into_iter()
+                .collect(),
             tif: open_data_package(ttb_path, "Map_tif")
                 .map_err(|error| eprintln!("TIFF textures unavailable: {error}"))
-                .ok(),
+                .into_iter()
+                .collect(),
         };
 
         let names: Vec<String> = model
@@ -1709,7 +1886,13 @@ impl MapTextures {
             .iter()
             .map(|material| material.texture_name.clone())
             .collect();
-        Self::from_names(&names, &packages)
+        let textures = Self::from_names(&names, &packages);
+        eprintln!(
+            "loaded {} unique textures for {} materials",
+            textures.images.len(),
+            names.len()
+        );
+        textures
     }
 
     /// One layer per unique texture name (case-insensitive); materials without a texture
@@ -1733,36 +1916,42 @@ impl MapTextures {
             .map(|image| image.width.max(image.height))
             .max()
             .unwrap_or(1);
-        eprintln!(
-            "loaded {} unique textures for {} materials",
-            textures.images.len(),
-            names.len()
-        );
         textures
     }
 
     /// Materials name a `.tga`, but the packages hold the same texture as `.dds` (96% of the
     /// 196 packed maps' materials) or, for the rest, as an uncompressed `.tif`.
     fn decode(&mut self, packages: &TexturePackages, texture_name: &str) -> Option<u32> {
-        let stem = texture_name
+        let (stem, extension) = texture_name
             .rsplit_once('.')
-            .map_or(texture_name, |(stem, _)| stem);
+            .unwrap_or((texture_name, "tga"));
         let dds = format!("{stem}.dds");
         let tif = format!("{stem}.tif");
-        let read = |archive: &Option<PakArchive>, entry: &str| {
-            archive
-                .as_ref()
-                .and_then(|archive| archive.read_entry(entry).ok())
+        let read = |archives: &[PakArchive], entry: &str| {
+            archives
+                .iter()
+                .find_map(|archive| archive.read_entry(entry).ok())
         };
-        let decoded = match read(&packages.dds, &dds) {
-            Some(bytes) => {
+        let from_dds = || {
+            read(&packages.dds, &dds).map(|bytes| {
                 DecodedImage::from_dds(&bytes).map_err(|error| format!("texture '{dds}': {error}"))
-            }
-            None => {
-                let bytes = read(&packages.tif, &tif)?;
-                DecodedImage::from_tiff(&bytes).map_err(|error| format!("texture '{tif}': {error}"))
-            }
+            })
         };
+        let from_tif = || {
+            read(&packages.tif, &tif).map(|bytes| {
+                DecodedImage::from_tiff(&bytes)
+                    .map(flipped_vertically)
+                    .map_err(|error| format!("texture '{tif}': {error}"))
+            })
+        };
+        // The extension the material asks for is authoritative: a name can exist as both a
+        // `.dds` and a different `.tif` (`ks-tree02`), and a `.tif` request means the TIFF.
+        // Other extensions (`.tga`) are stored in the packages as `.dds`.
+        let decoded = if extension.eq_ignore_ascii_case("tif") {
+            from_tif().or_else(from_dds)
+        } else {
+            from_dds().or_else(from_tif)
+        }?;
         match decoded {
             Ok(image) => {
                 self.images.push(image);
@@ -2024,6 +2213,21 @@ impl MapTextures {
         });
         (layout, bind_group)
     }
+}
+
+/// The map packages' TIFFs are stored top row first but sampled with `v = 0` at the bottom
+/// (like TGA): the trunk of `ks-m2tree` uses `v` 0.05..0.26 for its bark strip, which is the
+/// bottom of the file. DDS textures need no flip.
+fn flipped_vertically(image: DecodedImage) -> DecodedImage {
+    let row = image.width as usize * 4;
+    let rgba = image
+        .rgba
+        .chunks_exact(row)
+        .rev()
+        .flatten()
+        .copied()
+        .collect();
+    DecodedImage { rgba, ..image }
 }
 
 /// Nearest-neighbour resize to a square layer; exact for the power-of-two sizes the map uses.

@@ -7,6 +7,7 @@ pub mod map_script;
 pub mod model;
 pub mod motion;
 pub mod stm;
+pub mod tiff;
 pub mod ttb;
 pub mod vcl;
 

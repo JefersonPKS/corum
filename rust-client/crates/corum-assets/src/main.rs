@@ -164,6 +164,10 @@ fn stm_info(path: &str) -> Result<(), String> {
     println!("materials: {}", model.materials.len());
     println!("visual_objects: {}", model.objects.len());
     println!("skipped_objects: {}", model.skipped_objects.len());
+    println!("unread_objects: {}", model.unread_object_offsets.len());
+    for offset in model.unread_object_offsets.iter().take(10) {
+        println!("  UNREAD object header at 0x{offset:X}");
+    }
     println!("faces: {face_count}");
     println!("bounds_min: {minimum:?}");
     println!("bounds_max: {maximum:?}");

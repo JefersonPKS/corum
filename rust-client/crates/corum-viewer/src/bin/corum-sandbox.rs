@@ -25,6 +25,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const DEFAULT_MAP: &str = r"D:\Games\CorumOnline\Data\Map\1100.ttb";
+const DEFAULT_DATA_DIRECTORY: &str = r"D:\Games\CorumOnline\Data";
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 fn main() {
@@ -88,10 +89,45 @@ fn read_map_file(ttb_path: &Path, extension: &str) -> Option<Vec<u8>> {
     if let Ok(bytes) = fs::read(&sibling) {
         return Some(bytes);
     }
-    let canonical = ttb_path.canonicalize().ok()?;
-    let data = canonical.parent()?.parent()?;
-    let archive = PakArchive::open(data.join("Map_light").join("Map_light.pak")).ok()?;
-    archive.read_entry(sibling.file_name()?.to_str()?).ok()
+    let name = sibling.file_name()?.to_str()?;
+    // A few maps keep their lighting files in `Map_tif.pak` instead.
+    ["Map_light", "Map_tif"].into_iter().find_map(|package| {
+        let archive = open_data_package(ttb_path, package).ok()?;
+        archive.read_entry(name).ok()
+    })
+}
+
+/// Data directories to search for `Map_*` packages: the game folder that holds the `.ttb`
+/// (`<data>\Map\N.ttb`), then `CORUM_DATA`, then the default installation. This lets maps
+/// extracted to another folder still find their textures and lighting.
+fn data_directories(ttb_path: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Ok(canonical) = ttb_path.canonicalize()
+        && let Some(data) = canonical.parent().and_then(Path::parent)
+    {
+        directories.push(data.to_path_buf());
+    }
+    if let Some(configured) = env::var_os("CORUM_DATA") {
+        directories.push(PathBuf::from(configured));
+    }
+    directories.push(PathBuf::from(DEFAULT_DATA_DIRECTORY));
+    directories
+}
+
+/// Opens `<data>\<package>\<package>.pak` from the first data directory that has it.
+fn open_data_package(ttb_path: &Path, package: &str) -> Result<PakArchive, String> {
+    let mut last_error = format!("no data directory contains {package}");
+    for directory in data_directories(ttb_path) {
+        let path = directory.join(package).join(format!("{package}.pak"));
+        if !path.is_file() {
+            continue;
+        }
+        match PakArchive::open(&path) {
+            Ok(archive) => return Ok(archive),
+            Err(error) => last_error = format!("{}: {error}", path.display()),
+        }
+    }
+    Err(last_error)
 }
 
 /// Baked lightmaps (`.lm`). An empty file is valid: some maps ship none.
@@ -619,7 +655,7 @@ fn build_stm_vertices(
         } else {
             None
         };
-        let object_colors = if object.object_type == 1 {
+        let object_colors = if matches!(object.object_type, 0 | 1) {
             let base = baked_base;
             baked_base += object.positions.len();
             baked.and_then(|colors| colors.slice(base, object.positions.len()))
@@ -930,7 +966,7 @@ impl Vertex {
     }
 }
 
-const MAX_POINT_LIGHTS: usize = 32;
+const MAX_POINT_LIGHTS: usize = 256;
 
 /// One `GX_LIGHT` in sandbox units: `position_radius` is `xyz` + radius, `color` is `rgb` + unused.
 #[repr(C)]
@@ -962,6 +998,12 @@ impl LightsUniform {
 /// Converts `GX_LIGHT` records to sandbox space, using the same transform as the STM scene.
 fn build_point_lights(lights: &[MapLight], map: &TileMap) -> Vec<PointLight> {
     let scale = 1.0 / map.tile_size as f32;
+    if lights.len() > MAX_POINT_LIGHTS {
+        eprintln!(
+            "using the first {MAX_POINT_LIGHTS} of {} point lights",
+            lights.len()
+        );
+    }
     lights
         .iter()
         .take(MAX_POINT_LIGHTS)
@@ -1408,7 +1450,13 @@ impl DepthTarget {
     }
 }
 
-/// Map textures resolved from the `Map_dds` package, one array layer per unique texture.
+/// The texture packages a map can draw from.
+struct TexturePackages {
+    dds: Option<PakArchive>,
+    tif: Option<PakArchive>,
+}
+
+/// Map textures resolved from the `Map_dds` and `Map_tif` packages, one array layer per texture.
 #[derive(Default)]
 struct MapTextures {
     layer_size: u32,
@@ -1425,22 +1473,14 @@ impl MapTextures {
     /// `Map_dds` folder of the `Map` directory that holds the `.ttb`; missing textures
     /// simply fall back to the flat per-material colour.
     fn load(model: &StaticModelFile, ttb_path: &Path) -> Self {
-        let package = ttb_path
-            .canonicalize()
-            .ok()
-            .as_deref()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .map(|data| data.join("Map_dds").join("Map_dds.pak"));
-        let archive = package
-            .as_ref()
-            .and_then(|path| match PakArchive::open(path) {
-                Ok(archive) => Some(archive),
-                Err(error) => {
-                    eprintln!("textures unavailable ({}): {error}", path.display());
-                    None
-                }
-            });
+        let packages = TexturePackages {
+            dds: open_data_package(ttb_path, "Map_dds")
+                .map_err(|error| eprintln!("DDS textures unavailable: {error}"))
+                .ok(),
+            tif: open_data_package(ttb_path, "Map_tif")
+                .map_err(|error| eprintln!("TIFF textures unavailable: {error}"))
+                .ok(),
+        };
 
         let mut textures = Self::default();
         let mut layer_by_name: Vec<(String, Option<u32>)> = Vec::new();
@@ -1450,9 +1490,7 @@ impl MapTextures {
                 textures.material_layers.push(*layer);
                 continue;
             }
-            let layer = archive
-                .as_ref()
-                .and_then(|archive| textures.decode(archive, &material.texture_name));
+            let layer = textures.decode(&packages, &material.texture_name);
             layer_by_name.push((key, layer));
             textures.material_layers.push(layer);
         }
@@ -1470,19 +1508,35 @@ impl MapTextures {
         textures
     }
 
-    fn decode(&mut self, archive: &PakArchive, texture_name: &str) -> Option<u32> {
+    /// Materials name a `.tga`, but the packages hold the same texture as `.dds` (96% of the
+    /// 196 packed maps' materials) or, for the rest, as an uncompressed `.tif`.
+    fn decode(&mut self, packages: &TexturePackages, texture_name: &str) -> Option<u32> {
         let stem = texture_name
             .rsplit_once('.')
             .map_or(texture_name, |(stem, _)| stem);
-        let entry = format!("{stem}.dds");
-        let bytes = archive.read_entry(&entry).ok()?;
-        match DecodedImage::from_dds(&bytes) {
+        let dds = format!("{stem}.dds");
+        let tif = format!("{stem}.tif");
+        let read = |archive: &Option<PakArchive>, entry: &str| {
+            archive
+                .as_ref()
+                .and_then(|archive| archive.read_entry(entry).ok())
+        };
+        let decoded = match read(&packages.dds, &dds) {
+            Some(bytes) => {
+                DecodedImage::from_dds(&bytes).map_err(|error| format!("texture '{dds}': {error}"))
+            }
+            None => {
+                let bytes = read(&packages.tif, &tif)?;
+                DecodedImage::from_tiff(&bytes).map_err(|error| format!("texture '{tif}': {error}"))
+            }
+        };
+        match decoded {
             Ok(image) => {
                 self.images.push(image);
                 Some((self.images.len() - 1) as u32)
             }
-            Err(error) => {
-                eprintln!("texture '{entry}': {error}");
+            Err(message) => {
+                eprintln!("{message}");
                 None
             }
         }

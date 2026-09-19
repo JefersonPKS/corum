@@ -18,6 +18,7 @@ Legenda de certeza: **[confirmado]** medido nos arquivos ou visto na tela; **[hi
 | Geometria do cenário STM (20 objetos, 13.934 faces) | **[confirmado]** completa |
 | Texturas do cenário (51 únicas, DXT1, `Map_dds.pak`) | **[confirmado]** aplicadas, com mipmaps e alpha-test |
 | Colisão TTB, personagem e mob de teste (caixas) | funcionando |
+| Outros mapas | 196 mapas passam nos parsers; texturas DDS e TIFF resolvem; verificado na tela em 4 mapas |
 | Luz | Iluminação assada completa no `1100`: VCL (tipo 1) e lightmaps (tipo 3), em espaço gamma; luzes pontuais só em personagem e mob (B1–B4 prontos) |
 | Céu, névoa, água, objetos posicionados, mobs e personagem reais | ausentes |
 
@@ -29,12 +30,14 @@ Objetivo: qualquer mapa do cliente abre sem erro e mostra toda a geometria e os 
 
 | # | Tarefa | Notas | Aceite |
 |---|---|---|---|
-| A1 | Rodar o sandbox nos demais mapas (`1`, `10001`, `10002` soltos; os de `Map_stm.pak`, extraídos com `corum-assets extract`) | Compare o número de objetos lidos com a varredura por marcador `0xFFFFFFFF` (ver "Riscos" do STM). É a forma mais rápida de achar o próximo bug do parser | Lista de mapas com "N objetos lidos == N encontrados" |
-| A2 | Tornar o parser de STM estrito: falhar (ou avisar) quando sobrarem objetos que a heurística não aceitou | Hoje o laço para em silêncio | Aviso com offset do primeiro objeto não lido |
+| A1 ✅ | Rodar os parsers e o sandbox nos demais mapas | Feito com `tools/survey_maps.py` nos 196 mapas empacotados: 0 erros de parse, `.vcl` exato em 195, `.lm` sem divergência em 196, `.map` lido em 196. Achados: o tipo 0 (10.700 objetos) não era desenhado nem contado no VCL; o campo de tipo usa os bytes altos; nomes curtos eram rejeitados. Verificado na tela em `1100`, `5`, `101` e `750`. **Aberto:** o mapa `1` (ver README do `corum-assets`) | Cumprido, com o mapa `1` como exceção documentada |
+| A2 ✅ | Parser de STM que não perde objetos em silêncio | Feito: regra estrutural dos contadores no lugar do tamanho do nome, ressincronização e `unread_object_offsets` (mostrado por `stm-info`) | Cumprido: 0 objetos não lidos nos 196 mapas |
 | A3 | Normais por vértice do STM | Tipo 1 tem `V × [f32;3]` após 16 bytes **[hipótese: normais]**. Validar renderizando e comparando com a normal da face | Superfícies curvas sem facetas |
-| A4 | `GX_OBJECT`: ler `.MOD` (estático) e `.CHR` (animado) posicionados | O parser de MAP já lê posição, escala, eixo e ângulo. Falta instanciar o modelo. Só funciona para malhas estáticas até a Fase C1 | `RD_BONFIRE.CHR` e `village_*.MOD` aparecem nos mapas que os usam |
+| A4 | `GX_OBJECT`: ler `.MOD` (estático) e `.CHR` (animado) posicionados (o `.map` já traz a lista) | O parser de MAP já lê posição, escala, eixo e ângulo. Falta instanciar o modelo. Só funciona para malhas estáticas até a Fase C1 | `RD_BONFIRE.CHR` e `village_*.MOD` aparecem nos mapas que os usam |
 | A5 | Céu/fundo e névoa | Descobrir de onde vem a cor de fundo (pode estar em `.cdb`/`.cdt` ou no executável). Fase B5 cobre a névoa | Fundo deixa de ser azul sólido |
-| A6 | Água e transparência | Materiais `JE_water_map_*` (há texturas `je_water_map_*` em `Map_dds.pak` e `Map_tif.pak`). Requer blending e possivelmente animação por UV | Água semi-transparente |
+| A6 | Água e transparência | Texturas TIFF/DDS de água têm alfa de 90 a 210 (medido) e hoje perdem os pixels abaixo de 50% no *alpha test*. Requer uma passada com blending (ordenada de trás para frente) e possivelmente animação por UV; objetos tipo 0 (`ALP`) e `type_flags` podem indicar quais são translúcidos **[hipótese]** | Água semi-transparente, sem buracos |
+| A8 | Billboards (tipo 48) | 153 objetos, 4 vértices cada, nomes ` BILLBOARD*`. Placas que giram para a câmera (efeitos, chamas). Hoje são lidas e não desenhadas | Placa visível e voltada para a câmera |
+| A9 | Mapa `1` | 98.055 vértices tipo 0 contra 87.063 cores VCL; 257 lightmaps para 1 objeto tipo 3. Investigar o layout diferente antes de aceitar o mapa | `vcl-info` e `lm-info` sem divergência |
 | A7 | Sanidade de alinhamento TTB↔STM | Hoje ambos usam origem 0 e escala `1/tile_size`; visualmente o personagem fica no chão da área jogável **[confirmado no 1100]**. Repetir em outros mapas com `G` (grade) ligada | Grade TTB coincide com o piso em 3+ mapas |
 
 ## Fase B — Luz e sombra
@@ -86,7 +89,7 @@ Há três trilhas que quase não dependem uma da outra:
 | Formatos de modelo (C1–C3) | Decodificação de costuras/pesos em um modelo pequeno | mobs e personagem animados |
 | Dados de jogo (C5) e protocolo (Marcos 1–2 do plano) | Parser de CDB; login por CLI | integração com servidor |
 
-Recomendação: a iluminação assada do `1100` está completa (B1–B4). Seguir com **C0** (modelo estático no sandbox) e **A1** (abrir outros mapas, que testam também o `.lm` e o `.vcl` em outros casos), e deixar **C1** como investigação contínua, já que ela decide o cronograma dos mobs e do personagem.
+Recomendação: a iluminação assada está completa e validada em 196 mapas (B1–B4, A1, A2). Seguir com **C0** (modelo estático no sandbox) e **A4** (objetos posicionados, que usam a mesma carga de `.MOD`), e deixar **C1** como investigação contínua, já que ela decide o cronograma dos mobs e do personagem.
 
 ## Riscos e decisões pendentes
 

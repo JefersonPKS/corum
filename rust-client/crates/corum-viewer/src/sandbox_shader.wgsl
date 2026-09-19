@@ -1,4 +1,4 @@
-const MAX_POINT_LIGHTS: u32 = 32u;
+const MAX_POINT_LIGHTS: u32 = 256u;
 
 struct Camera {
     view_projection: mat4x4<f32>,

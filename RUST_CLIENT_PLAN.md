@@ -201,8 +201,10 @@ Regras de arquitetura:
   lê entradas de PAK em memória. A sandbox usa isso para texturizar o cenário
   `1100` com as 51 texturas únicas de `Map_dds.pak`, aplica a iluminação
   assada (cor por vértice `.vcl` e lightmaps `.lm`, ambos decifrados) em espaço
-  gamma e as luzes pontuais do `.MAP` nos atores; objetos posicionados, céu e
-  sombras de atores ainda faltam. O roteiro detalhado de mapa, luz e
+  gamma e as luzes pontuais do `.MAP` nos atores. Os parsers de mapa foram
+  conferidos nos 196 mapas empacotados (0 erros; `.vcl` exato em 195; `.lm` sem
+  divergência em 196) e há decodificadores de DDS e de TIFF para as texturas.
+  Objetos posicionados, céu, água translúcida e sombras de atores ainda faltam. O roteiro detalhado de mapa, luz e
   sombra, mobs e personagem está em `rust-client/docs/VISUAL_ROADMAP.md`.
 - A prova gráfica atual cobre malhas estáticas diretamente decodificáveis. O
   próximo bloqueio visual é o cenário `.STM`; para personagens reais, é o

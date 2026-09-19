@@ -15,6 +15,10 @@ pub struct StaticModelFile {
     pub materials: Vec<StaticMaterial>,
     pub objects: Vec<StaticObject>,
     pub skipped_objects: Vec<SkippedStaticObject>,
+    /// Offsets of object headers found after the parser stopped. The object loop only
+    /// continues while the next offset passes a heuristic, so anything listed here is scenery
+    /// that was silently lost; an empty list means the file was read to the end.
+    pub unread_object_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,7 +29,12 @@ pub struct StaticMaterial {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StaticObject {
     pub name: String,
+    /// Low byte of the object's type field: 0 and 1 are vertex-lit (same layout, both covered
+    /// by the `.vcl`), 3 is lightmapped. The top byte of the field is in `type_flags`.
     pub object_type: u32,
+    /// Bits above the type byte. Zero in the `1100` scene; elsewhere it holds values such as
+    /// 5, 10..60 and 12 whose meaning is unknown (transparency percentage is a guess).
+    pub type_flags: u32,
     pub positions: Vec<[f32; 3]>,
     pub texture_coordinates: Vec<[f32; 2]>,
     pub groups: Vec<StaticFaceGroup>,
@@ -54,16 +63,17 @@ pub struct LightmapDescriptor {
 pub struct SkippedStaticObject {
     pub name: String,
     pub object_type: u32,
+    pub type_flags: u32,
 }
 
 impl StaticModelFile {
-    /// Total vertices of the vertex-lit (type 1) objects, which is the number of colours
-    /// the matching `.vcl` must hold.
+    /// Total vertices of the vertex-lit (type 0 and 1) objects, which is the number of colours
+    /// the matching `.vcl` must hold: 191 of the 196 packed maps agree exactly.
     #[must_use]
     pub fn vertex_lit_vertex_count(&self) -> usize {
         self.objects
             .iter()
-            .filter(|object| object.object_type == 1)
+            .filter(|object| matches!(object.object_type, 0 | 1))
             .map(|object| object.positions.len())
             .sum()
     }
@@ -104,26 +114,44 @@ impl StaticModelFile {
             let vertex_count = count(bytes, counts, "vertex count")?;
             let secondary_count = count(bytes, counts + 12, "secondary index count")?;
             let group_count = count(bytes, counts + 24, "face group count")?;
-            let object_type = u32_at(bytes, counts + 28)?;
+            let type_field = u32_at(bytes, counts + 28)?;
+            let (object_type, type_flags) = (type_field & 0xff, type_field >> 8);
 
-            if !matches!(object_type, 1 | 3) {
-                skipped_objects.push(SkippedStaticObject { name, object_type });
+            if !matches!(object_type, 0 | 1 | 3) {
+                skipped_objects.push(SkippedStaticObject {
+                    name,
+                    object_type,
+                    type_flags,
+                });
                 cursor =
                     find_next_object(bytes, cursor + OBJECT_DATA_OFFSET).unwrap_or(bytes.len());
                 continue;
             }
 
-            let (object, end) = parse_visual_object(
-                bytes,
-                cursor,
+            let header = ObjectHeader {
                 name,
                 vertex_count,
                 secondary_count,
                 group_count,
                 object_type,
-            )?;
+                type_flags,
+            };
+            let (object, end) = parse_visual_object(bytes, cursor, header)?;
             objects.push(object);
-            cursor = end;
+            // A few objects carry padding the layout does not account for. If the computed end
+            // is not a header, resynchronise on the next one instead of dropping the rest.
+            cursor = if is_object_header(bytes, end) {
+                end
+            } else {
+                find_next_object(bytes, end).unwrap_or(bytes.len())
+            };
+        }
+
+        let mut unread_object_offsets = Vec::new();
+        let mut scan_from = cursor;
+        while let Some(offset) = find_next_object(bytes, scan_from) {
+            unread_object_offsets.push(offset);
+            scan_from = offset + OBJECT_DATA_OFFSET;
         }
 
         Ok(Self {
@@ -131,19 +159,34 @@ impl StaticModelFile {
             materials,
             objects,
             skipped_objects,
+            unread_object_offsets,
         })
     }
 }
 
-fn parse_visual_object(
-    bytes: &[u8],
-    object_start: usize,
+/// Fields of an object header that the object body depends on.
+struct ObjectHeader {
     name: String,
     vertex_count: usize,
     secondary_count: usize,
     group_count: usize,
     object_type: u32,
+    type_flags: u32,
+}
+
+fn parse_visual_object(
+    bytes: &[u8],
+    object_start: usize,
+    header: ObjectHeader,
 ) -> Result<(StaticObject, usize), StmError> {
+    let ObjectHeader {
+        name,
+        vertex_count,
+        secondary_count,
+        group_count,
+        object_type,
+        type_flags,
+    } = header;
     let mut cursor = object_start + OBJECT_DATA_OFFSET;
     let mut positions = Vec::with_capacity(vertex_count);
     for _ in 0..vertex_count {
@@ -233,6 +276,7 @@ fn parse_visual_object(
         StaticObject {
             name,
             object_type,
+            type_flags,
             positions,
             texture_coordinates,
             groups,
@@ -271,12 +315,24 @@ fn is_object_header(bytes: &[u8], start: usize) -> bool {
     let Ok(name) = c_string(bytes, name_start, 128) else {
         return false;
     };
-    if name.len() < 3 || name.chars().any(char::is_control) {
+    // Short names exist (`09`), so the name only has to be non-empty text; the counters below
+    // are the real check.
+    if name.is_empty() || name.chars().any(char::is_control) {
         return false;
     }
-    [0, 4, 8, 12, 16, 24]
-        .into_iter()
-        .all(|offset| count(bytes, counts + offset, "object count").is_ok())
+    let field = |offset: usize| count(bytes, counts + offset, "object count").ok();
+    // Header counters are `V, V, A, B, V` with `A + B = V`, `V` being the vertex count.
+    let (Some(vertices), Some(same), Some(first), Some(second), Some(again), Some(_)) = (
+        field(0),
+        field(4),
+        field(8),
+        field(12),
+        field(16),
+        field(24),
+    ) else {
+        return false;
+    };
+    same == vertices && again == vertices && first.checked_add(second) == Some(vertices)
 }
 
 fn find_next_object(bytes: &[u8], from: usize) -> Option<usize> {
@@ -381,7 +437,7 @@ mod tests {
         bytes[name - 4..name].copy_from_slice(&u32::MAX.to_le_bytes());
         bytes[name..name + 8].copy_from_slice(b"triangle");
         let counts = object_start + OBJECT_COUNTS_OFFSET;
-        for offset in [0, 4, 16] {
+        for offset in [0, 4, 8, 16] {
             bytes[counts + offset..counts + offset + 4].copy_from_slice(&3_u32.to_le_bytes());
         }
         bytes[counts + 24..counts + 28].copy_from_slice(&1_u32.to_le_bytes());
@@ -405,6 +461,7 @@ mod tests {
         }
 
         let model = StaticModelFile::parse(&bytes).expect("synthetic STM should parse");
+        assert!(model.unread_object_offsets.is_empty());
         assert_eq!(model.materials[0].texture_name, "tile.tga");
         assert_eq!(model.objects.len(), 1);
         assert_eq!(model.objects[0].groups[0].faces, vec![[0, 1, 2]]);
@@ -424,7 +481,7 @@ mod tests {
         bytes[name - 4..name].copy_from_slice(&u32::MAX.to_le_bytes());
         bytes[name..name + 5].copy_from_slice(b"floor");
         let counts = object_start + OBJECT_COUNTS_OFFSET;
-        for offset in [0, 4, 16] {
+        for offset in [0, 4, 8, 16] {
             bytes[counts + offset..counts + offset + 4].copy_from_slice(&3_u32.to_le_bytes());
         }
         bytes[counts + 24..counts + 28].copy_from_slice(&1_u32.to_le_bytes());

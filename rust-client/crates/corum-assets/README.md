@@ -84,9 +84,13 @@ Três tipos de keyframe foram separados por tamanho:
 
 As três semânticas finais ainda serão confirmadas contra o motor, mas a divisão binária é consistente: 3.875 registros sem morph do pacote `Effect` obedecem exatamente a essa equação, sem divergências. Todos os 197 ANM de `Effect` e os 259 de `Character` são aceitos. A quinta track é morph por vértice e tem tamanho dependente da malha; por enquanto o parser preserva sua contagem e extensão sem interpretá-la.
 
-## Texturas DDS
+## Texturas (DDS e TIFF)
 
-`dds::DecodedImage::from_dds` decodifica o maior nível de mip de DXT1, DXT3, DXT5 e RGB/RGBA de 24/32 bits para RGBA8. As 51 texturas únicas do mapa `1100` (todas DXT1, de 32x256 a 256x256) vivem em `Map_dds.pak` e são lidas com `PakArchive::read_entry`, sem extrair para disco. O material do `.stm` referencia `nome.tga`, mas o pacote guarda `nome.dds`.
+`dds::DecodedImage::from_dds` decodifica o maior nível de mip de DXT1, DXT3, DXT5 e RGB/RGBA de 24/32 bits para RGBA8. As 51 texturas únicas do mapa `1100` (todas DXT1, de 32x256 a 256x256) vivem em `Map_dds.pak` e são lidas com `PakArchive::read_entry`, sem extrair para disco. O material do `.stm` referencia `nome.tga`, mas o pacote guarda `nome.dds` ou `nome.tif`.
+
+`DecodedImage::from_tiff` (`tiff.rs`) lê os TIFFs de `Map_tif.pak`: little-endian, **sem compressão**, RGB de 8 bits com um 4º canal de alfa (ou 3 ou 5 canais; o excedente é ignorado). Em 119 dos 400 arquivos a assinatura `0x002A` do cabeçalho vem trocada por `0xCCCC`, e o restante do arquivo é padrão, então a assinatura não é verificada. O alfa é real: recortes duros (grama, árvores, `min 0`) e translucidez (água, `min 90..210`).
+
+Cobertura medida nos 196 mapas empacotados (7.921 materiais): 7.628 em `Map_dds.pak`, 287 em `Map_tif.pak` e 6 sem textura (4 com nome vazio e `wall_9_skell.tga`). Um `thumbs.db` perdido dentro de `Map_tif.pak` é ignorado. `Map_tif.pak` também guarda alguns `.vcl` e `.lm` (ex.: `1206`).
 
 ## Formatos de mapa
 
@@ -97,7 +101,7 @@ Um mapa `N` é composto por arquivos em `Data\Map` (soltos ou dentro de `Map_stm
 | `N.ttb` | grade de colisão/atributos de tiles | `ttb::TileMap` |
 | `N.map` | script textual: limites, referência ao `.stm`, objetos e luzes | `map_script::MapScript` (`GX_LIGHT` incluído) |
 | `N.stm` | geometria estática do cenário (posições, UVs, materiais, faces) | `stm::StaticModelFile` |
-| `N.vcl` | cor pré-calculada por vértice dos objetos STM tipo 1 | `vcl::VertexColors` |
+| `N.vcl` | cor pré-calculada por vértice dos objetos STM tipo 0 e 1 | `vcl::VertexColors` |
 | `N.lm` | lightmaps (RGB565) dos objetos STM tipo 3 | `lightmap::LightmapFile` |
 | `N.lfg`, `N.ofg`, `N.hfl`, `N.am2`, `N.vch` | luzes/efeitos/altura/outros | não investigados |
 
@@ -155,28 +159,43 @@ GX_TRIGGER N { }
 | `0x150` | `V` de novo |
 | `0x154` | `0xFFFFFFFF` |
 | `0x158` | quantidade de grupos de faces |
-| `0x15C` | **tipo do objeto** (1 ou 3 nos mapas vistos) |
+| `0x15C` | **campo de tipo**: o **byte baixo** é o tipo (0, 1, 3 ou 48); os bytes altos são outra coisa (`type_flags`, ver abaixo) |
 
 Depois do cabeçalho: `V` posições `[f32; 3]`, `V` UVs `[f32; 2]` e `B` índices `u32` secundários (semântica desconhecida). Em seguida, os grupos.
 
 **Grupo (28 bytes + faces).** `+0` índice do material, `+8` quantidade de faces, `+12` a mesma quantidade repetida, `+20` quantidade de coordenadas de lightmap; `+4`, `+16` e `+24` sem significado conhecido. Depois vêm `faces × [u16; 3]` (índices no vetor de vértices do objeto).
 
+**Tipos (byte baixo do campo em `0x15C`), medidos em 196 mapas (~27.600 objetos):**
+
+| Tipo | Objetos | Layout | Iluminação |
+|---:|---:|---|---|
+| 0 | ~10.700 | igual ao tipo 1 (o fim do objeto cai exatamente no próximo cabeçalho em 99%) | cor por vértice (`.vcl`) |
+| 1 | ~7.500 | descrito abaixo | cor por vértice (`.vcl`) |
+| 3 | ~9.000 | com lightmap, descrito abaixo | lightmap (`.lm`) |
+| 48 | 153 | como o tipo 3, sem UVs de lightmap, e 16 bytes finais; nomes ` BILLBOARD*`, 4 vértices | placa que gira para a câmera (não desenhada ainda) |
+
+Nomes com `ALP`/`Alp`/`alpha` aparecem no tipo 0, o que sugere transparência **[hipótese]**. `type_flags` (bits acima do byte de tipo) é 0 no `1100`; em outros mapas vale 5, 10, 12, 20, 30, 40, 50 ou 60 (múltiplos de 10 na maioria; talvez um percentual de transparência **[hipótese]**). Só o byte baixo decide o layout.
+
 **Fim do objeto depende do tipo:**
 
-- **Tipo 1 (nome termina em ` V`, iluminação por vértice):** o grupo termina nas faces. Após o último grupo há 16 bytes não interpretados e `V × [f32; 3]` (provavelmente normais por vértice; o sandbox ainda usa a normal da face). O objeto tem 0 coordenadas de lightmap.
+- **Tipos 0 e 1 (o tipo 1 tem nome terminado em ` V`, iluminação por vértice):** o grupo termina nas faces. Após o último grupo há 16 bytes não interpretados e `V × [f32; 3]` (provavelmente normais por vértice; o sandbox ainda usa a normal da face). O objeto tem 0 coordenadas de lightmap.
 - **Tipo 3 (nome termina em ` L`, lightmap):** cada grupo é seguido por `lightmap × [f32; 2]`; o valor é sempre `3 × faces` (um UV de lightmap por canto de face, em ordem de face, lidos em `StaticFaceGroup::lightmap_coordinates`). Depois dos grupos vêm 12 bytes zerados e o cabeçalho `(primeiro campo, largura, altura)` do registro `.lm` do objeto (`StaticObject::lightmap`), seguido de floats ainda não interpretados (parecem uma normal/plano e limites do objeto). O parser procura o próximo cabeçalho de objeto por varredura.
 
-O `1100` tem 11 objetos tipo 1 (22.157 vértices) e 9 tipo 3 (598 faces, 1.794 UVs de lightmap).
+O `1100` tem 11 objetos tipo 1 (22.157 vértices), nenhum tipo 0 e 9 tipo 3 (598 faces, 1.794 UVs de lightmap).
+
+**Como o parser acha os objetos, e o que ele garante.** Um cabeçalho é aceito quando tem o marcador `0xFFFFFFFF` em `0xBC`, um nome não vazio sem caracteres de controle e os contadores coerentes: `V, V, A, B, V` em `0x140..0x150` com `A + B = V`. Nomes curtos existem (`09`), por isso o tamanho do nome não conta; a regra dos contadores é o que separa cabeçalho de dado. Se o fim calculado de um objeto não cair em um cabeçalho (há objetos com preenchimento fora do layout), o parser ressincroniza no próximo cabeçalho em vez de parar. `StaticModelFile::unread_object_offsets` lista qualquer cabeçalho que sobrar depois de o laço terminar (vazio = arquivo lido até o fim); `stm-info` mostra o total como `unread_objects`.
+
+Resultado nos 196 mapas: 0 erros de parse, 0 objetos não lidos. Antes dessa regra, 5 mapas perdiam objetos em silêncio (`1`, `750`, `917`, `919` e `1002`), e o `.vcl` deles não fechava.
 
 **Riscos conhecidos do parser:**
 
-- O laço só continua enquanto `is_object_header` aceitar o próximo offset (marcador, nome com 3+ caracteres imprimíveis e contagens ≤ 10.000.000). Se um objeto não passar na heurística, os seguintes são descartados **sem erro**. No `1100` foi verificado por varredura independente que os 20 objetos são lidos; em outros mapas, compare o número de objetos com uma varredura antes de confiar.
-- Objetos de tipo diferente de 1 e 3 vão para `skipped_objects`. Ainda não apareceram.
+- Objetos de tipo diferente de 0, 1 e 3 (na prática o 48) vão para `skipped_objects`, sem geometria. O laço de objetos os atravessa por varredura.
+- O mapa `1` é uma exceção não resolvida: 221 dos 222 objetos são tipo 0 (98.055 vértices) e o `.vcl` tem 87.063 cores; o `.lm` tem 257 registros para um único objeto tipo 3. É o mapa mais antigo (2006) e parece montado de outro jeito; qualquer suposição sobre ele é **[hipótese]**.
 - Alguns objetos trazem vértices com `0xCDCDCDCD` (`-431602080` como `f32`): memória não inicializada do exportador. No `1100` (objetos 0x39630, 0x6e2c2, 0x98992 e 0xc178c) nenhuma face os referencia. Quem renderiza deve descartar faces que os usem em vez de confiar nos limites do arquivo.
 
 ### VCL — cor por vértice (confirmado, parser em `vcl::VertexColors`)
 
-Sem cabeçalho: uma sequência de `u32` em `AARRGGBB` (na memória: bytes `B, G, R, A`; alfa `0xFF` nas amostras). No `1100`, `88.628 / 4 = 22.157` cores, exatamente a soma dos vértices dos objetos tipo 1. As cores seguem a ordem dos objetos tipo 1 no `.stm` e, dentro de cada objeto, a ordem dos vértices. Isso foi verificado: a diferença média de luminância entre vértices ligados por uma aresta é 3,9, contra 16,6 entre pares aleatórios do mesmo objeto (o alfa é sempre `0xFF` e a luminância varia de 70 a 252). `corum-assets vcl-info <N.vcl> <N.stm>` confere a contagem. É a iluminação "assada" desses objetos, com tons neutros a levemente coloridos.
+Sem cabeçalho: uma sequência de `u32` em `AARRGGBB` (na memória: bytes `B, G, R, A`; alfa `0xFF` nas amostras). No `1100`, `88.628 / 4 = 22.157` cores, exatamente a soma dos vértices dos objetos tipo 1. Nos outros mapas o `.vcl` cobre os vértices dos objetos **tipo 0 e 1**: **195 dos 196 mapas** empacotados batem exatamente (a exceção é o mapa `1`). As cores seguem a ordem dos objetos tipo 1 no `.stm` e, dentro de cada objeto, a ordem dos vértices. Isso foi verificado: a diferença média de luminância entre vértices ligados por uma aresta é 3,9, contra 16,6 entre pares aleatórios do mesmo objeto (o alfa é sempre `0xFF` e a luminância varia de 70 a 252). `corum-assets vcl-info <N.vcl> <N.stm>` confere a contagem. É a iluminação "assada" desses objetos, com tons neutros a levemente coloridos.
 
 ### LM — lightmaps (decifrado, parser em `lightmap::LightmapFile`)
 
@@ -191,7 +210,7 @@ u32  altura
 
 **[confirmado no `1100`]** 9 registros (32×32 ×7, 64×128 e 128×128) percorrem os 63.596 bytes sem sobra. Há um registro por objeto STM tipo 3, **na ordem em que os objetos aparecem no `.stm`**: o objeto repete `(primeiro campo, largura, altura)` do seu registro nos dados finais (ver o STM), e os 9 pares conferem (`corum-assets lm-info <N.lm> <N.stm>`).
 
-O conteúdo é iluminação: um cinza uniforme (`0x4228`, ≈ RGB 66/69/66) com "poças" de luz quente e azulada, além de regiões pretas não usadas nos atlas. Quatro dos seis mapas 32×32 do piso são totalmente uniformes. Os UVs que apontam para os registros são os 3 por face guardados no STM. Um `.lm` de 0 bytes (como `619` e `604` em `Map_light.pak`) é válido e significa "sem lightmaps".
+O conteúdo é iluminação: um cinza uniforme (`0x4228`, ≈ RGB 66/69/66) com "poças" de luz quente e azulada, além de regiões pretas não usadas nos atlas. Quatro dos seis mapas 32×32 do piso são totalmente uniformes. Os UVs que apontam para os registros são os 3 por face guardados no STM. Um `.lm` de 0 bytes (como `619` e `604` em `Map_light.pak`) é válido e significa "sem lightmaps". Nos 196 mapas, o emparelhamento objeto↔registro (cabeçalho repetido) confere em todos, exceto o caso já citado do mapa `1`.
 
 Fica em aberto: o significado do primeiro campo e se o valor de fábrica do cinza (`0x4228`) é um ambiente constante do mapa.
 
@@ -206,6 +225,21 @@ cargo run -p corum-assets -- chr-info .\extracted\dfymiss.chr
 cargo run -p corum-assets -- mod-info .\extracted\dfymiss.mod
 cargo run -p corum-assets -- mod-to-obj .\extracted\dfymiss.mod .\dfymiss.obj
 cargo run -p corum-assets -- anm-info .\extracted\dfmiss.anm
+cargo run -p corum-assets -- extract-all "D:\Games\CorumOnline\Data\Map_stm\Map_stm.pak" .\maps
+
+# mapas (aceitam arquivos soltos ou extraídos)
+cargo run -p corum-assets -- ttb-info "D:\Games\CorumOnline\Data\Map\1100.ttb"
+cargo run -p corum-assets -- map-info "D:\Games\CorumOnline\Data\Map\1100.map"   # inclui luzes
+cargo run -p corum-assets -- stm-info "D:\Games\CorumOnline\Data\Map\1100.stm"   # mostra unread_objects
+cargo run -p corum-assets -- vcl-info "D:\Games\CorumOnline\Data\Map\1100.vcl" "D:\Games\CorumOnline\Data\Map\1100.stm"
+cargo run -p corum-assets -- lm-info  "D:\Games\CorumOnline\Data\Map\1100.lm"  "D:\Games\CorumOnline\Data\Map\1100.stm"
+```
+
+Para conferir todos os mapas de uma vez (extrai os arquivos dos pacotes e roda `stm-info`, `vcl-info`, `lm-info` e `map-info` em cada um):
+
+```powershell
+cargo build -p corum-assets
+python tools/survey_maps.py "D:\Games\CorumOnline\Data" target/verification/maps
 ```
 
 O extrator rejeita caminhos absolutos, componentes `..`, nomes sem terminador e registros que ultrapassem o tamanho do arquivo.

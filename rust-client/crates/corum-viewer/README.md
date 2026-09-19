@@ -107,6 +107,22 @@ Texturas e iluminação são procuradas, nesta ordem: na pasta de dados do jogo 
 
 Verificados na tela: `1100` (masmorra escura com poças de luz coloridas), `5` (vila, com sombras assadas no chão), `101` (masmorra com 141 luzes) e `750` (templo flutuante). Nos três últimos todos os materiais receberam textura.
 
+### Transparência, fogo e água
+
+Cada vértice carrega uma **classe de mistura**, e há três pipelines que desenham os mesmos buffers, cada um mantendo só a sua classe: **opaco** (com recorte abaixo de 50% de alfa), **mistura alfa** (`src_alpha, 1 - src_alpha`, sem escrever profundidade) e **aditivo** (`src_alpha, 1`, sem escrever profundidade e sem iluminação). A ordem é opaco, depois alfa, depois aditivo, e passadas sem nada são puladas.
+
+A classe vem de:
+
+1. **aditivo:** o material tem a flag `0x4` (só modelos), ou a textura é um efeito sobre preto (opaca e com mais de 70% dos texels quase pretos);
+2. **mistura alfa:** a textura tem mais de 60% dos texels com alfa parcial (água, mar, vidro);
+3. **opaco:** o resto.
+
+Os números e as evidências estão em "Flags de material e mistura" no README do `corum-assets`. Vale para o cenário (STM), os objetos do mapa e os atores. Verificado na tela: fogo em tochas e braseiros do `604` (chamas brilhantes, sem o quadrado preto) e água e jatos translúcidos no `201`.
+
+**Limites:** a mistura alfa **não é ordenada** (superfícies translúcidas sobrepostas podem aparecer na ordem errada), a água **não rola** (a flag `0x10000000` não foi implementada) e os planos de chama ficam todos visíveis ao mesmo tempo, porque a animação que os alterna ainda não roda. O STM não tem flags de material decifradas, então lá só vale a regra da textura.
+
+Para apontar a câmera para um ponto (por exemplo uma fogueira), use `CORUM_PLAYER_AT=x,z` (coordenadas do script do mapa) junto com `CORUM_CAMERA`.
+
 ### Objetos do mapa (`GX_OBJECT`)
 
 Os objetos listados no `.map` (árvores, casas, cercas, barris, ruínas, fogueiras) são
@@ -118,8 +134,7 @@ pontuais, e não têm cor assada. A tecla `O` mostra ou oculta os objetos. O san
 `placed N of M map objects`.
 
 Verificados na tela: `5` (vila: 43 objetos, casas, pinheiros e arbustos), `604` (savana com
-ilhas: 713 objetos em 10 modelos) e `750` (2 objetos). **Ainda não desenhados corretamente:**
-chamas e tochas (`.CHR` de fogo) aparecem como quadrados pretos, porque falta a mistura aditiva.
+ilhas: 713 objetos em 10 modelos) e `750` (2 objetos). Fogo e água: ver a seção acima.
 
 ### Personagem e mob reais
 

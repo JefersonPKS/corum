@@ -128,6 +128,25 @@ As três semânticas finais ainda serão confirmadas contra o motor, mas a divis
 
 Cobertura medida nos 196 mapas empacotados (7.921 materiais): 7.628 em `Map_dds.pak`, 287 em `Map_tif.pak` e 6 sem textura (4 com nome vazio e `wall_9_skell.tga`). Um `thumbs.db` perdido dentro de `Map_tif.pak` é ignorado. `Map_tif.pak` também guarda alguns `.vcl` e `.lm` (ex.: `1206`).
 
+### Flags de material e mistura (transparência, fogo, água)
+
+`ModelMaterial::flags` nos 9.888 materiais dos 378 modelos de `Map_chr.pak`: `0x1` (5.926), `0x4` (1.924), `0x101` (1.317), `0x0` (378, o material-base), `0x104` (248), `0x10000104` (52), `0x10000004` (35) e `0x10000001` (8). Leitura, com o que foi medido e o que é hipótese:
+
+| Bit | Evidência | Leitura |
+|---|---|---|
+| `0x4` | aparece em `RD_EFFECT_FIRE`, `fireb_02` (planos de chama), `Two_Window_Light1` (brilho de janela), `waterfall_a`, `pretaeffect` | **mistura aditiva** (efeito que soma luz) |
+| `0x100` | paredes e blocos de `110.mod` (`JY_D1_wall_01`, `JY_D1_block_04`) | provavelmente **dois lados** **[hipótese]** |
+| `0x10000000` | `waterfall_a`, `wseacolor_001` (mar), `MKY-rush04` | provavelmente **animação de UV** (rolagem) **[hipótese]**; não implementada |
+| `0x1` | quase todo o resto | material comum |
+
+Só o `0x4` foi usado. A translucidez da água não vem de flag (`water001` tem flag `0`): vem do alfa da textura.
+
+**Classificação por conteúdo da textura**, medida:
+
+- **Água/vidro (mistura alfa):** 21 dos 399 TIFFs com alfa têm mais de 60% dos texels com alfa parcial (água, mar, vidro, cachoeira, placas). Água: `jy_cbwwater_001` 100% parcial (alfa médio 0,79), `wseacolor_001` 100% (0,24). Recortes duros (`ks-tree02` 1%, `ks-stree01` 0%, grama 19–24%) ficam abaixo de 30%. Corte em 60%.
+- **Efeitos sobre preto (aditivo):** das texturas opacas, 71 têm mais de 50% dos texels quase pretos (`max(rgb) < 12`) e são **quase todas efeitos**: `fireb_02` 0,75, `rd_effect_fire` 0,80, `fire`, `smoke_train`, `lightning`, `waterfall_b`, `w0760_effect` (brilho de arma), os prefixos `mky-*` e `kcs-fire*`. Um material normal como `lighthouse01` fica em 0,52. Corte em 70%. No preto, somar não muda nada, então "aditivo" e "preto transparente" são visualmente equivalentes.
+- Por que o fogo precisava disso: `JY_D1_fire_a` tem um plano com `fireb_02` e flag `0x1` (não `0x4`); com fundo preto opaco ele aparecia como um quadrado preto.
+
 ### Nomes de textura dos modelos e orientação dos TIFF
 
 - A extensão pedida pelo material vale: `KS-tree02.tif` pede o TIFF, enquanto materiais `.tga` estão nos pacotes como `.dds`. Isso importa porque o mesmo nome pode existir nos dois formatos com **imagens diferentes** (`ks-tree02.dds` em `Map_dds.pak` e `ks-tree02.tif` em `Map_tif.pak`). O `Paklist.sin` só lista os pacotes (`Character, DamageNumber, Effect, Item, Map_chr, Map_dds, Map_light, Map_stm, Map_tga, Map_tif, Monster, Npc, UI`) e não decide a prioridade.

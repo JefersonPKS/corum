@@ -206,8 +206,8 @@ Regras de arquitetura:
   divergência em 196) e há decodificadores de DDS e de TIFF para as texturas.
   O sandbox já usa modelos reais (NPC humano e monstro alado, texturizados e na
   pose de bind, ainda sem animação) e coloca nos mapas os objetos do `.map`
-  (10.282 em 158 mapas: árvores, casas, cercas, ruínas). Céu, água translúcida,
-  efeitos aditivos (fogo), sombras de atores e skinning/animação ainda faltam. O roteiro detalhado de mapa, luz e
+  (10.282 em 158 mapas: árvores, casas, cercas, ruínas), com água translúcida e
+  fogo aditivo. Céu, sombras de atores e skinning/animação ainda faltam. O roteiro detalhado de mapa, luz e
   sombra, mobs e personagem está em `rust-client/docs/VISUAL_ROADMAP.md`.
 - A prova gráfica atual cobre malhas estáticas diretamente decodificáveis. O
   próximo bloqueio visual é o cenário `.STM`; para personagens reais, é o

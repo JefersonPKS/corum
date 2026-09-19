@@ -32,6 +32,22 @@ const DEFAULT_DATA_DIRECTORY: &str = r"D:\Games\CorumOnline\Data";
 /// Default actors as `Package/entry`; override with `CORUM_PLAYER` and `CORUM_MOB`.
 const DEFAULT_PLAYER_MODEL: &str = "Npc/npc007.mod";
 const DEFAULT_MOB_MODEL: &str = "Monster/m00010.mod";
+/// Blend classes stored in [`Vertex::blend`]; each has its own pipeline.
+const BLEND_OPAQUE: f32 = 0.0;
+const BLEND_ALPHA: f32 = 1.0;
+const BLEND_ADDITIVE: f32 = 2.0;
+/// `.MOD` material flag for additive blending: set on fire (`RD_EFFECT_FIRE`), window glows
+/// (`Two_Window_Light1`), waterfalls and effect quads, and never on ordinary surfaces.
+const MATERIAL_ADDITIVE: u32 = 0x4;
+/// A texture is translucent (water, glass) when more than this fraction of its texels have a
+/// partial alpha. Measured on the 399 TIFFs with alpha: water and glass sit at 0.9..1.0, hard
+/// cut-outs (leaves, grass, fences) below 0.3.
+const TRANSLUCENT_PARTIAL_FRACTION: f32 = 0.6;
+/// An opaque texture with more than this fraction of near-black texels is an effect drawn on a
+/// black background (fire, smoke, lightning, glows): added to the frame, black adds nothing.
+/// Measured on the 71 opaque textures above 50% black: they are almost all effects (`fireb_02`
+/// is 0.75, `rd_effect_fire` 0.80, `lighthouse01` 0.52 is a real surface).
+const BLACK_KEYED_FRACTION: f32 = 0.7;
 /// Rotation (radians) added to the movement heading so a model's front faces where it walks.
 const ACTOR_YAW_OFFSET: f32 = 0.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -87,6 +103,22 @@ fn run() -> Result<(), String> {
     scene.props = load_props(&path, &scene.map);
     scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
+    // Debug: `CORUM_PLAYER_AT=x,z` starts the player at those map-script coordinates, to point
+    // the camera at a specific spot in repeatable screenshots.
+    if let Some([x, z]) = env::var("CORUM_PLAYER_AT").ok().and_then(|value| {
+        let parts: Vec<f32> = value
+            .split(',')
+            .filter_map(|part| part.trim().parse().ok())
+            .collect();
+        <[f32; 2]>::try_from(parts).ok()
+    }) {
+        let units = 1.0 / tile_size;
+        scene.player = Vec3::new(
+            x * units - scene.map.width as f32 * 0.5,
+            0.0,
+            z * units - scene.map.height as f32 * 0.5,
+        );
+    }
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = SandboxApplication::new(path, scene, textures);
     event_loop
@@ -761,6 +793,7 @@ fn build_stm_vertices(
             } else {
                 material_color(texture_name, group.material_index)
             };
+            let stm_blend = textures.blend_class(layer, false);
             let layer = layer.map_or(-1.0, |layer| layer as f32);
             for (face_index, face) in group.faces.iter().enumerate() {
                 let Some(source_positions) = face
@@ -790,7 +823,8 @@ fn build_stm_vertices(
                         .get(usize::from(face[corner]))
                         .copied()
                         .unwrap_or([0.0, 0.0]);
-                    let vertex = Vertex::textured(position, normal, color, uv, layer);
+                    let vertex =
+                        Vertex::textured(position, normal, color, uv, layer).with_blend(stm_blend);
                     vertices.push(match object_colors {
                         Some(colors) if layer >= 0.0 => {
                             let [red, green, blue, _] = colors[usize::from(face[corner])];
@@ -1001,10 +1035,12 @@ struct Vertex {
     lightmap_uv: [f32; 2],
     /// Lightmap array layer, or `-1.0` when the vertex has no lightmap.
     lightmap_layer: f32,
+    /// One of the `BLEND_*` classes.
+    blend: f32,
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x3,
@@ -1013,6 +1049,7 @@ impl Vertex {
         5 => Float32,
         6 => Float32x2,
         7 => Float32,
+        8 => Float32,
     ];
 
     fn new(position: Vec3, normal: Vec3, color: [f32; 3]) -> Self {
@@ -1029,7 +1066,13 @@ impl Vertex {
             baked: 0.0,
             lightmap_uv: [0.0, 0.0],
             lightmap_layer: -1.0,
+            blend: BLEND_OPAQUE,
         }
+    }
+
+    fn with_blend(mut self, blend: f32) -> Self {
+        self.blend = blend;
+        self
     }
 
     fn lightmapped(mut self, uv: [f32; 2], layer: f32) -> Self {
@@ -1199,6 +1242,10 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
+    blend_pipeline: wgpu::RenderPipeline,
+    additive_pipeline: wgpu::RenderPipeline,
+    /// Whether anything is alpha-blended / additive, so empty passes are skipped.
+    uses_blend: [bool; 2],
     texture_bind_group: wgpu::BindGroup,
     actors: Vec<ActorGpu>,
     props: Vec<PropGpu>,
@@ -1319,43 +1366,90 @@ impl Renderer {
             bind_group_layouts: &[Some(&camera_layout), Some(&texture_layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("sandbox pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex_main"),
-                compilation_options: Default::default(),
-                buffers: &[Some(Vertex::layout())],
+        // Three pipelines share the buffers and keep only the vertices of their own blend class.
+        // The blended ones read the depth buffer but do not write it.
+        let additive = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
             },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                front_face: wgpu::FrontFace::Ccw,
-                ..Default::default()
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        };
+        let make_pipeline = |label: &str, fragment: &str, blend: wgpu::BlendState, depth_write| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vertex_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(Vertex::layout())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(fragment),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline(
+            "sandbox opaque pipeline",
+            "fragment_opaque",
+            wgpu::BlendState::REPLACE,
+            true,
+        );
+        let blend_pipeline = make_pipeline(
+            "sandbox alpha pipeline",
+            "fragment_alpha",
+            wgpu::BlendState::ALPHA_BLENDING,
+            false,
+        );
+        let additive_pipeline = make_pipeline(
+            "sandbox additive pipeline",
+            "fragment_additive",
+            additive,
+            false,
+        );
         let vertices = scene.vertices();
+        let has_class = |class: f32| {
+            let is_class = |vertex: &Vertex| vertex.blend == class;
+            vertices.iter().any(is_class)
+                || scene
+                    .props
+                    .iter()
+                    .any(|batch| batch.vertices.iter().any(is_class))
+                || [&scene.player_model, &scene.mob_model]
+                    .into_iter()
+                    .flatten()
+                    .any(|model| model.vertices.iter().any(is_class))
+        };
+        let uses_blend = [has_class(BLEND_ALPHA), has_class(BLEND_ADDITIVE)];
         let vertex_capacity = scene.maximum_vertex_count();
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sandbox vertices"),
@@ -1412,6 +1506,9 @@ impl Renderer {
             config,
             size,
             pipeline,
+            blend_pipeline,
+            additive_pipeline,
+            uses_blend,
             texture_bind_group,
             actors,
             props,
@@ -1545,22 +1642,34 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_bind_group(1, &self.texture_bind_group, &[]);
-            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.draw(0..self.vertex_count, 0..1);
-            if self.scene.show_props {
-                for prop in &self.props {
-                    pass.set_bind_group(1, &prop.bind_group, &[]);
-                    pass.set_vertex_buffer(0, prop.buffer.slice(..));
-                    pass.draw(0..prop.count, 0..1);
+            // Opaque first, then alpha-blended, then additive, so translucent surfaces and glows
+            // sit on top of what is behind them.
+            let passes = [
+                (&self.pipeline, true),
+                (&self.blend_pipeline, self.uses_blend[0]),
+                (&self.additive_pipeline, self.uses_blend[1]),
+            ];
+            for (pipeline, enabled) in passes {
+                if !enabled {
+                    continue;
                 }
-            }
-            for actor in self.actors.iter().filter(|actor| actor.count > 0) {
-                pass.set_bind_group(1, &actor.bind_group, &[]);
-                pass.set_vertex_buffer(0, actor.buffer.slice(..));
-                pass.draw(0..actor.count, 0..1);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(1, &self.texture_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                pass.draw(0..self.vertex_count, 0..1);
+                if self.scene.show_props {
+                    for prop in &self.props {
+                        pass.set_bind_group(1, &prop.bind_group, &[]);
+                        pass.set_vertex_buffer(0, prop.buffer.slice(..));
+                        pass.draw(0..prop.count, 0..1);
+                    }
+                }
+                for actor in self.actors.iter().filter(|actor| actor.count > 0) {
+                    pass.set_bind_group(1, &actor.bind_group, &[]);
+                    pass.set_vertex_buffer(0, actor.buffer.slice(..));
+                    pass.draw(0..actor.count, 0..1);
+                }
             }
         }
         self.queue.submit(Some(encoder.finish()));
@@ -1673,6 +1782,9 @@ impl ActorModel {
                 // The group's `material` is a selector, not an index (see the assets README).
                 let material = model.material_index_for_group(group.material_index);
                 let layer = material.and_then(|index| textures.layer_for_material(index as u32));
+                let additive = material
+                    .is_some_and(|index| model.materials[index].flags & MATERIAL_ADDITIVE != 0);
+                let blend = textures.blend_class(layer, additive);
                 let color = match (layer, material) {
                     (Some(_), _) => [1.0; 3],
                     (None, Some(index)) => {
@@ -1692,13 +1804,16 @@ impl ActorModel {
                             .get(corner)
                             .copied()
                             .unwrap_or([0.0, 0.0]);
-                        vertices.push(Vertex::textured(
-                            points[corner],
-                            normals[corner].normalize_or(Vec3::Y),
-                            color,
-                            uv,
-                            layer,
-                        ));
+                        vertices.push(
+                            Vertex::textured(
+                                points[corner],
+                                normals[corner].normalize_or(Vec3::Y),
+                                color,
+                                uv,
+                                layer,
+                            )
+                            .with_blend(blend),
+                        );
                     }
                 }
             }
@@ -1858,6 +1973,10 @@ struct TexturePackages {
 struct MapTextures {
     layer_size: u32,
     images: Vec<DecodedImage>,
+    /// Per image: mostly partial alpha (water, glass), so it is alpha-blended.
+    translucent: Vec<bool>,
+    /// Per image: an effect on a black background, so it is additive.
+    black_keyed: Vec<bool>,
     material_layers: Vec<Option<u32>>,
     lightmap_size: u32,
     lightmaps: Vec<DecodedImage>,
@@ -1954,6 +2073,8 @@ impl MapTextures {
         }?;
         match decoded {
             Ok(image) => {
+                self.translucent.push(is_translucent(&image));
+                self.black_keyed.push(is_black_keyed(&image));
                 self.images.push(image);
                 Some((self.images.len() - 1) as u32)
             }
@@ -1961,6 +2082,31 @@ impl MapTextures {
                 eprintln!("{message}");
                 None
             }
+        }
+    }
+
+    fn is_translucent(&self, layer: u32) -> bool {
+        self.translucent
+            .get(layer as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Blend class of a surface: additive when its material asks for it or its texture is an
+    /// effect on black, alpha-blended for translucent textures, opaque (with cut-outs) otherwise.
+    fn blend_class(&self, layer: Option<u32>, material_additive: bool) -> f32 {
+        let black_keyed = layer.is_some_and(|layer| {
+            self.black_keyed
+                .get(layer as usize)
+                .copied()
+                .unwrap_or(false)
+        });
+        if material_additive || black_keyed {
+            BLEND_ADDITIVE
+        } else if layer.is_some_and(|layer| self.is_translucent(layer)) {
+            BLEND_ALPHA
+        } else {
+            BLEND_OPAQUE
         }
     }
 
@@ -2215,6 +2361,46 @@ impl MapTextures {
     }
 }
 
+/// True for an opaque texture that is mostly black: an effect meant to be added to the frame.
+fn is_black_keyed(image: &DecodedImage) -> bool {
+    let texels = image.rgba.len() / 4;
+    if texels == 0 {
+        return false;
+    }
+    let opaque = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|t| t[3] >= 250)
+        .count();
+    let black = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|t| t[0].max(t[1]).max(t[2]) < 12)
+        .count();
+    opaque as f32 / texels as f32 > 0.95 && black as f32 / texels as f32 > BLACK_KEYED_FRACTION
+}
+
+/// True when most texels have a partial alpha, as water and glass do. Hard cut-outs have
+/// texels that are almost all fully opaque or fully clear.
+fn is_translucent(image: &DecodedImage) -> bool {
+    let texels = image.rgba.len() / 4;
+    if texels == 0 {
+        return false;
+    }
+    let partial = image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|texel| (6..=249).contains(&texel[3]))
+        .count();
+    partial as f32 / texels as f32 > TRANSLUCENT_PARTIAL_FRACTION
+}
+
 /// The map packages' TIFFs are stored top row first but sampled with `v = 0` at the bottom
 /// (like TGA): the trunk of `ks-m2tree` uses `v` 0.05..0.26 for its bark strip, which is the
 /// bottom of the file. DDS textures need no flip.
@@ -2289,4 +2475,62 @@ fn downsample(level: &[u8], size: u32) -> Vec<u8> {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(texels: &[[u8; 4]]) -> DecodedImage {
+        DecodedImage {
+            width: texels.len() as u32,
+            height: 1,
+            rgba: texels.iter().flatten().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn water_like_alpha_is_translucent_but_cutouts_are_not() {
+        let water = image(&[[10, 20, 30, 120]; 8]);
+        assert!(is_translucent(&water));
+        // A leaf: mostly fully clear or fully opaque, a little antialiasing.
+        let mut leaf = vec![[0, 0, 0, 0]; 4];
+        leaf.extend([[0, 90, 0, 255]; 4]);
+        leaf.push([0, 90, 0, 128]);
+        assert!(!is_translucent(&image(&leaf)));
+    }
+
+    #[test]
+    fn opaque_mostly_black_textures_are_effects() {
+        let mut fire = vec![[0, 0, 0, 255]; 8];
+        fire.extend([[255, 160, 20, 255]; 2]);
+        assert!(is_black_keyed(&image(&fire)));
+        // A dark wall is not mostly pure black, and an alpha cut-out is never additive.
+        assert!(!is_black_keyed(&image(&[[40, 38, 36, 255]; 10])));
+        assert!(!is_black_keyed(&image(&[[0, 0, 0, 0]; 10])));
+    }
+
+    #[test]
+    fn blend_class_prefers_the_material_flag_then_the_texture() {
+        let textures = MapTextures {
+            translucent: vec![false, true, false],
+            black_keyed: vec![false, false, true],
+            ..MapTextures::default()
+        };
+        assert_eq!(textures.blend_class(Some(0), false), BLEND_OPAQUE);
+        assert_eq!(textures.blend_class(Some(1), false), BLEND_ALPHA);
+        assert_eq!(textures.blend_class(Some(2), false), BLEND_ADDITIVE);
+        assert_eq!(textures.blend_class(Some(0), true), BLEND_ADDITIVE);
+        assert_eq!(textures.blend_class(None, false), BLEND_OPAQUE);
+    }
+
+    #[test]
+    fn tiff_rows_are_flipped_to_the_tga_origin() {
+        let image = DecodedImage {
+            width: 1,
+            height: 2,
+            rgba: vec![1, 1, 1, 1, 2, 2, 2, 2],
+        };
+        assert_eq!(flipped_vertically(image).rgba, vec![2, 2, 2, 2, 1, 1, 1, 1]);
+    }
 }

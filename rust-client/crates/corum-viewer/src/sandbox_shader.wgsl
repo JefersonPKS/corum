@@ -1,5 +1,10 @@
 const MAX_POINT_LIGHTS: u32 = 256u;
 
+// Blend classes stored per vertex (see `BLEND_*` in the sandbox).
+const CLASS_OPAQUE: f32 = 0.0;
+const CLASS_ALPHA: f32 = 1.0;
+const CLASS_ADDITIVE: f32 = 2.0;
+
 struct Camera {
     view_projection: mat4x4<f32>,
     // xyz = directional light, w = gain applied to baked lighting (VCL and lightmaps)
@@ -40,6 +45,7 @@ struct VertexInput {
     @location(5) baked: f32,
     @location(6) lightmap_uv: vec2<f32>,
     @location(7) lightmap_layer: f32,
+    @location(8) blend: f32,
 };
 
 struct VertexOutput {
@@ -52,6 +58,7 @@ struct VertexOutput {
     @location(5) @interpolate(flat) baked: f32,
     @location(6) lightmap_uv: vec2<f32>,
     @location(7) @interpolate(flat) lightmap_layer: f32,
+    @location(8) @interpolate(flat) blend: f32,
 };
 
 @vertex
@@ -66,6 +73,7 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
     output.baked = input.baked;
     output.lightmap_uv = input.lightmap_uv;
     output.lightmap_layer = input.lightmap_layer;
+    output.blend = input.blend;
     return output;
 }
 
@@ -84,29 +92,17 @@ fn point_light_contribution(position: vec3<f32>, normal: vec3<f32>) -> vec3<f32>
     return total;
 }
 
-@fragment
-fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Sample unconditionally so derivatives stay in uniform control flow.
-    let texel = textureSample(map_textures, map_sampler, input.uv, i32(max(input.layer, 0.0) + 0.5));
-    let light = textureSample(
-        lightmaps,
-        lightmap_sampler,
-        input.lightmap_uv,
-        i32(max(input.lightmap_layer, 0.0) + 0.5),
-    );
-    let textured = input.layer >= 0.0;
-    if textured && texel.a < 0.5 {
-        discard;
-    }
+// Colour of the fragment for the classes that are lit (opaque and alpha-blended).
+fn shade(input: VertexOutput, texel: vec4<f32>, light: vec4<f32>, textured: bool) -> vec3<f32> {
     let gain = camera.light_direction.w;
 
     // Baked vertex colours (VCL) already contain the lighting: texture x VCL, nothing added.
     if input.baked > 0.5 {
-        return vec4<f32>(texel.rgb * input.color * gain, 1.0);
+        return texel.rgb * input.color * gain;
     }
     // Baked lightmap: texture x lightmap.
     if input.lightmap_layer >= 0.0 {
-        return vec4<f32>(texel.rgb * light.rgb * gain, 1.0);
+        return texel.rgb * light.rgb * gain;
     }
 
     let normal = normalize(input.normal);
@@ -121,7 +117,56 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Flat colours and the lighting model above were tuned as linear values; encode them for
     // the gamma-space surface. Textures already are gamma-space, so only the light is encoded.
     if textured {
-        return vec4<f32>(albedo * pow(lighting, vec3<f32>(1.0 / 2.2)), 1.0);
+        return albedo * pow(lighting, vec3<f32>(1.0 / 2.2));
     }
-    return vec4<f32>(pow(albedo * lighting, vec3<f32>(1.0 / 2.2)), 1.0);
+    return pow(albedo * lighting, vec3<f32>(1.0 / 2.2));
+}
+
+// Each pipeline draws the same buffers and keeps only the vertices of its own class.
+
+@fragment
+fn fragment_opaque(input: VertexOutput) -> @location(0) vec4<f32> {
+    // Sample unconditionally so derivatives stay in uniform control flow.
+    let texel = textureSample(map_textures, map_sampler, input.uv, i32(max(input.layer, 0.0) + 0.5));
+    let light = textureSample(
+        lightmaps,
+        lightmap_sampler,
+        input.lightmap_uv,
+        i32(max(input.lightmap_layer, 0.0) + 0.5),
+    );
+    let textured = input.layer >= 0.0;
+    if input.blend != CLASS_OPAQUE {
+        discard;
+    }
+    // Hard cut-outs (leaves, grass, fences).
+    if textured && texel.a < 0.5 {
+        discard;
+    }
+    return vec4<f32>(shade(input, texel, light, textured), 1.0);
+}
+
+@fragment
+fn fragment_alpha(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(map_textures, map_sampler, input.uv, i32(max(input.layer, 0.0) + 0.5));
+    let light = textureSample(
+        lightmaps,
+        lightmap_sampler,
+        input.lightmap_uv,
+        i32(max(input.lightmap_layer, 0.0) + 0.5),
+    );
+    if input.blend != CLASS_ALPHA || texel.a < 0.01 {
+        discard;
+    }
+    // Translucent surfaces (water, glass): lit like the rest, mixed with what is behind.
+    return vec4<f32>(shade(input, texel, light, input.layer >= 0.0), texel.a);
+}
+
+@fragment
+fn fragment_additive(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(map_textures, map_sampler, input.uv, i32(max(input.layer, 0.0) + 0.5));
+    if input.blend != CLASS_ADDITIVE {
+        discard;
+    }
+    // Light-emitting effects (fire, glows, waterfalls): never shaded, added to the frame.
+    return vec4<f32>(texel.rgb * input.color, texel.a);
 }

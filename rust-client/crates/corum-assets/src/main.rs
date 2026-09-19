@@ -6,6 +6,7 @@ use corum_assets::model::ModelFile;
 use corum_assets::motion::MotionFile;
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
+use corum_assets::vcl::VertexColors;
 use corum_assets::{PakArchive, PakError};
 use std::env;
 use std::fs;
@@ -40,6 +41,7 @@ fn run() -> Result<(), String> {
         "ttb-info" if arguments.len() == 2 => ttb_info(&arguments[1]),
         "map-info" if arguments.len() == 2 => map_info(&arguments[1]),
         "stm-info" if arguments.len() == 2 => stm_info(&arguments[1]),
+        "vcl-info" if arguments.len() == 3 => vcl_info(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             Ok(())
@@ -69,12 +71,32 @@ fn map_info(path: &str) -> Result<(), String> {
     println!("static_model: {:?}", map.static_model);
     println!("height_field: {:?}", map.height_field);
     println!("objects: {}", map.objects.len());
+    println!("lights: {}", map.lights.len());
     for object in map.objects.iter().take(20) {
         println!(
             "  {} id={} position={:?} scale={:?}",
             object.resource, object.id, object.position, object.scale
         );
     }
+    Ok(())
+}
+
+fn vcl_info(vcl_path: &str, stm_path: &str) -> Result<(), String> {
+    let vcl = VertexColors::parse(&fs::read(vcl_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let stm = StaticModelFile::parse(&fs::read(stm_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let expected = stm.vertex_lit_vertex_count();
+    println!("colors: {}", vcl.colors.len());
+    println!("vertex_lit_vertices: {expected}");
+    println!(
+        "match: {}",
+        if vcl.colors.len() == expected {
+            "yes"
+        } else {
+            "NO"
+        }
+    );
     Ok(())
 }
 
@@ -280,6 +302,7 @@ fn usage() -> String {
         "  corum-assets ttb-info <map.ttb>",
         "  corum-assets map-info <scene.map>",
         "  corum-assets stm-info <scene.stm>",
+        "  corum-assets vcl-info <scene.vcl> <scene.stm>",
     ]
     .join("\n")
 }

@@ -7,6 +7,30 @@ pub struct MapScript {
     pub static_model: Option<String>,
     pub height_field: Option<String>,
     pub objects: Vec<MapObject>,
+    pub lights: Vec<MapLight>,
+}
+
+/// One `GX_LIGHT` entry: a coloured point light with a radius of influence.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MapLight {
+    /// Colour as written in the script, `AARRGGBB`.
+    pub argb: u32,
+    pub position: [f32; 3],
+    pub radius: f32,
+    /// Trailing integer, `1000` in every sample; meaning unknown.
+    pub parameter: u32,
+}
+
+impl MapLight {
+    /// Colour channels as `[r, g, b]` in `0.0..=1.0`.
+    #[must_use]
+    pub fn rgb(&self) -> [f32; 3] {
+        [
+            ((self.argb >> 16) & 0xff) as f32 / 255.0,
+            ((self.argb >> 8) & 0xff) as f32 / 255.0,
+            (self.argb & 0xff) as f32 / 255.0,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +57,7 @@ impl MapScript {
             .filter(|value| !value.eq_ignore_ascii_case("NA"))
             .map(str::to_owned);
         let objects = parse_objects(&tokens)?;
+        let lights = parse_lights(&tokens)?;
 
         Ok(Self {
             bounds_min,
@@ -40,6 +65,7 @@ impl MapScript {
             static_model,
             height_field,
             objects,
+            lights,
         })
     }
 }
@@ -85,6 +111,41 @@ fn parse_objects(tokens: &[&str]) -> Result<Vec<MapObject>, MapScriptError> {
         }
     }
     Ok(objects)
+}
+
+/// Reads `GX_LIGHT`. The declared count includes a zeroed terminator record
+/// (`0 0 0 0 0 1000`), which is not a light and is dropped.
+fn parse_lights(tokens: &[&str]) -> Result<Vec<MapLight>, MapScriptError> {
+    let Some(section) = tokens.iter().position(|token| *token == "GX_LIGHT") else {
+        return Ok(Vec::new());
+    };
+    let count = parse_u32(tokens, section + 1, "GX_LIGHT count")? as usize;
+    let mut cursor = section + 2;
+    if tokens.get(cursor) == Some(&"{") {
+        cursor += 1;
+    }
+
+    let mut lights = Vec::new();
+    for _ in 0..count {
+        let color = token(tokens, cursor, "light colour")?;
+        let argb = u32::from_str_radix(color, 16)
+            .map_err(|_| MapScriptError::new(cursor, "invalid light colour"))?;
+        cursor += 1;
+        let position = parse_vector(tokens, &mut cursor, "light position")?;
+        let radius = parse_f32(tokens, cursor, "light radius")?;
+        cursor += 1;
+        let parameter = parse_u32(tokens, cursor, "light parameter")?;
+        cursor += 1;
+        if argb != 0 || radius != 0.0 {
+            lights.push(MapLight {
+                argb,
+                position,
+                radius,
+                parameter,
+            });
+        }
+    }
+    Ok(lights)
 }
 
 fn vector_after(tokens: &[&str], name: &str) -> Result<Option<[f32; 3]>, MapScriptError> {
@@ -184,5 +245,26 @@ mod tests {
         assert_eq!(map.objects.len(), 1);
         assert_eq!(map.objects[0].position, [100.0, 200.0, 300.0]);
         assert_eq!(map.objects[0].flags, "100000A");
+    }
+
+    #[test]
+    fn parses_lights_and_drops_the_zero_terminator() {
+        let script = br#"
+            GX_LIGHT 3
+            {
+                FF323296 1772.8 200.0 2936.56 2000.0 1000
+                FFDC50FF 2449.82 120.0 3073.49 300.0 1000
+                0 0.0 0.0 0.0 0.0 1000
+            }
+            GX_TRIGGER 0 { }
+        "#;
+        let map = MapScript::parse(script).expect("synthetic lights should parse");
+        assert_eq!(map.lights.len(), 2);
+        assert_eq!(map.lights[0].position, [1772.8, 200.0, 2936.56]);
+        assert_eq!(map.lights[0].radius, 2000.0);
+        let [red, green, blue] = map.lights[0].rgb();
+        assert!((red - 50.0 / 255.0).abs() < 1e-6);
+        assert!((green - 50.0 / 255.0).abs() < 1e-6);
+        assert!((blue - 150.0 / 255.0).abs() < 1e-6);
     }
 }

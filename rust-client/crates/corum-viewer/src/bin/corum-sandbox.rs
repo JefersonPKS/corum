@@ -10,8 +10,10 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use corum_assets::PakArchive;
 use corum_assets::dds::DecodedImage;
+use corum_assets::map_script::{MapLight, MapScript};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
+use corum_assets::vcl::VertexColors;
 use glam::{Vec2, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -57,12 +59,64 @@ fn run() -> Result<(), String> {
         .as_ref()
         .map(|model| MapTextures::load(model, &path))
         .unwrap_or_default();
-    let scene = SandboxScene::new(map, static_model.as_ref(), &textures)?;
+    let baked = load_baked_colors(&path, static_model.as_ref());
+    let lights = load_lights(&path);
+    let scene = SandboxScene::new(
+        map,
+        static_model.as_ref(),
+        &textures,
+        baked.as_ref(),
+        &lights,
+    )?;
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = SandboxApplication::new(path, scene, textures);
     event_loop
         .run_app(&mut application)
         .map_err(|error| error.to_string())
+}
+
+/// Baked per-vertex lighting next to the `.ttb`. Absence is normal (not every map has one).
+fn load_baked_colors(ttb_path: &Path, model: Option<&StaticModelFile>) -> Option<VertexColors> {
+    let model = model?;
+    let path = ttb_path.with_extension("vcl");
+    let bytes = fs::read(&path).ok()?;
+    match VertexColors::parse(&bytes) {
+        Ok(colors) if colors.colors.len() == model.vertex_lit_vertex_count() => {
+            eprintln!("loaded VCL: {} baked vertex colours", colors.colors.len());
+            Some(colors)
+        }
+        Ok(colors) => {
+            eprintln!(
+                "ignoring '{}': {} colours for {} vertex-lit vertices",
+                path.display(),
+                colors.colors.len(),
+                model.vertex_lit_vertex_count()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!("ignoring '{}': {error}", path.display());
+            None
+        }
+    }
+}
+
+/// `GX_LIGHT` entries from the `.map` script next to the `.ttb`.
+fn load_lights(ttb_path: &Path) -> Vec<MapLight> {
+    let path = ttb_path.with_extension("map");
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    match MapScript::parse(&bytes) {
+        Ok(script) => {
+            eprintln!("loaded MAP: {} point lights", script.lights.len());
+            script.lights
+        }
+        Err(error) => {
+            eprintln!("ignoring '{}': {error}", path.display());
+            Vec::new()
+        }
+    }
 }
 
 struct SandboxApplication {
@@ -86,7 +140,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         format!(
-            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades",
+            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("map.ttb"),
@@ -205,6 +259,8 @@ struct SandboxScene {
     selected_object: Option<usize>,
     show_collision: bool,
     show_entities: bool,
+    show_point_lights: bool,
+    lights: Vec<PointLight>,
     player: Vec3,
     mob: Vec3,
     mob_direction: usize,
@@ -218,14 +274,17 @@ impl SandboxScene {
         map: TileMap,
         static_model: Option<&StaticModelFile>,
         textures: &MapTextures,
+        baked: Option<&VertexColors>,
+        map_lights: &[MapLight],
     ) -> Result<Self, String> {
         let player = closest_walkable_to_center(&map)
             .ok_or_else(|| "TTB map has no walkable tile".to_owned())?;
         let mob = farthest_walkable(&map, player).unwrap_or(player);
         let (stm_vertices, stm_objects) = static_model
-            .map(|model| build_stm_vertices(model, &map, textures))
+            .map(|model| build_stm_vertices(model, &map, textures, baked))
             .unwrap_or_default();
         let map_vertices = build_map_vertices(&map);
+        let lights = build_point_lights(map_lights, &map);
         eprintln!(
             "loaded TTB {}x{}, tile size {}, {} walkable tiles",
             map.width,
@@ -254,6 +313,8 @@ impl SandboxScene {
             selected_object: None,
             show_collision: false,
             show_entities: true,
+            show_point_lights: true,
+            lights,
             player,
             mob,
             mob_direction: 0,
@@ -272,6 +333,7 @@ impl SandboxScene {
             KeyCode::ShiftLeft | KeyCode::ShiftRight => self.input.run = pressed,
             KeyCode::KeyG if pressed => self.show_collision = !self.show_collision,
             KeyCode::KeyH if pressed => self.show_entities = !self.show_entities,
+            KeyCode::KeyL if pressed => self.show_point_lights = !self.show_point_lights,
             _ => {}
         }
     }
@@ -469,6 +531,7 @@ fn build_stm_vertices(
     model: &StaticModelFile,
     map: &TileMap,
     textures: &MapTextures,
+    baked: Option<&VertexColors>,
 ) -> (Vec<Vertex>, Vec<StmObjectView>) {
     let mut minimum = Vec3::splat(f32::INFINITY);
     let mut maximum = Vec3::splat(f32::NEG_INFINITY);
@@ -505,8 +568,17 @@ fn build_stm_vertices(
         .sum();
     let mut vertices = Vec::with_capacity(face_count * 3);
     let mut objects = Vec::with_capacity(model.objects.len());
+    // `.vcl` colours follow the file order of the type 1 objects, one per vertex.
+    let mut baked_base = 0_usize;
     for object in &model.objects {
         let vertex_start = vertices.len();
+        let object_colors = if object.object_type == 1 {
+            let base = baked_base;
+            baked_base += object.positions.len();
+            baked.and_then(|colors| colors.slice(base, object.positions.len()))
+        } else {
+            None
+        };
         for group in &object.groups {
             let texture_name = model
                 .materials
@@ -548,7 +620,14 @@ fn build_stm_vertices(
                         .get(usize::from(face[corner]))
                         .copied()
                         .unwrap_or([0.0, 0.0]);
-                    vertices.push(Vertex::textured(position, normal, color, uv, layer));
+                    let vertex = Vertex::textured(position, normal, color, uv, layer);
+                    vertices.push(match object_colors {
+                        Some(colors) if layer >= 0.0 => {
+                            let [red, green, blue, _] = colors[usize::from(face[corner])];
+                            vertex.baked([red, green, blue].map(|c| f32::from(c) / 255.0))
+                        }
+                        _ => vertex,
+                    });
                 }
             }
         }
@@ -739,15 +818,18 @@ struct Vertex {
     color: [f32; 3],
     uv: [f32; 2],
     layer: f32,
+    /// `1.0` when `color` is baked lighting (VCL) that replaces dynamic lighting.
+    baked: f32,
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x3,
         3 => Float32x2,
         4 => Float32,
+        5 => Float32,
     ];
 
     fn new(position: Vec3, normal: Vec3, color: [f32; 3]) -> Self {
@@ -761,7 +843,14 @@ impl Vertex {
             color,
             uv,
             layer,
+            baked: 0.0,
         }
+    }
+
+    fn baked(mut self, color: [f32; 3]) -> Self {
+        self.color = color;
+        self.baked = 1.0;
+        self
     }
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -771,6 +860,56 @@ impl Vertex {
             attributes: &Self::ATTRIBUTES,
         }
     }
+}
+
+const MAX_POINT_LIGHTS: usize = 32;
+
+/// One `GX_LIGHT` in sandbox units: `position_radius` is `xyz` + radius, `color` is `rgb` + unused.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct PointLight {
+    position_radius: [f32; 4],
+    color: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct LightsUniform {
+    count: [u32; 4],
+    lights: [PointLight; MAX_POINT_LIGHTS],
+}
+
+impl LightsUniform {
+    fn new(lights: &[PointLight], enabled: bool) -> Self {
+        let mut uniform = Self::zeroed();
+        if enabled {
+            let count = lights.len().min(MAX_POINT_LIGHTS);
+            uniform.lights[..count].copy_from_slice(&lights[..count]);
+            uniform.count[0] = count as u32;
+        }
+        uniform
+    }
+}
+
+/// Converts `GX_LIGHT` records to sandbox space, using the same transform as the STM scene.
+fn build_point_lights(lights: &[MapLight], map: &TileMap) -> Vec<PointLight> {
+    let scale = 1.0 / map.tile_size as f32;
+    lights
+        .iter()
+        .take(MAX_POINT_LIGHTS)
+        .map(|light| {
+            let [red, green, blue] = light.rgb();
+            PointLight {
+                position_radius: [
+                    light.position[0] * scale - map.width as f32 * 0.5,
+                    light.position[1] * scale,
+                    light.position[2] * scale - map.height as f32 * 0.5,
+                    light.radius * scale,
+                ],
+                color: [red, green, blue, 0.0],
+            }
+        })
+        .collect()
 }
 
 #[repr(C)]
@@ -789,13 +928,28 @@ struct Camera {
     last_cursor: Option<PhysicalPosition<f64>>,
 }
 
+/// Debug override for repeatable screenshots: `CORUM_CAMERA=yaw,pitch,distance`
+/// (radians, radians, tiles). Also used when the camera is reset with `R`.
+fn debug_camera() -> Option<(f32, f32, f32)> {
+    let value = env::var("CORUM_CAMERA").ok()?;
+    let parts: Vec<f32> = value
+        .split(',')
+        .filter_map(|part| part.trim().parse().ok())
+        .collect();
+    let [yaw, pitch, distance] = parts[..] else {
+        return None;
+    };
+    Some((yaw, pitch.clamp(0.08, 1.48), distance.clamp(1.0, 120.0)))
+}
+
 impl Camera {
     fn new(target: Vec3) -> Self {
+        let (yaw, pitch, distance) = debug_camera().unwrap_or((0.75, 0.68, 12.0));
         Self {
             target,
-            yaw: 0.75,
-            pitch: 0.68,
-            distance: 12.0,
+            yaw,
+            pitch,
+            distance,
             dragging: false,
             last_cursor: None,
         }
@@ -853,6 +1007,7 @@ struct Renderer {
     vertex_capacity: usize,
     vertex_count: u32,
     camera_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth: DepthTarget,
     camera: Camera,
@@ -905,26 +1060,44 @@ impl Renderer {
             contents: bytemuck::bytes_of(&camera.uniform(width as f32 / height as f32)),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let lights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sandbox point lights"),
+            contents: bytemuck::bytes_of(&LightsUniform::new(
+                &scene.lights,
+                scene.show_point_lights,
+            )),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let uniform_entry = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sandbox camera layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                uniform_entry(1, wgpu::ShaderStages::FRAGMENT),
+            ],
         });
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("sandbox camera bind group"),
             layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lights_buffer.as_entire_binding(),
+                },
+            ],
         });
         let (texture_layout, texture_bind_group) = textures.upload(&device, &queue);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -995,6 +1168,7 @@ impl Renderer {
             vertex_capacity,
             vertex_count: vertices.len() as u32,
             camera_buffer,
+            lights_buffer,
             camera_bind_group,
             depth,
             camera,
@@ -1048,6 +1222,9 @@ impl Renderer {
                 .uniform(self.config.width as f32 / self.config.height as f32);
             self.queue
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+            let lights = LightsUniform::new(&self.scene.lights, self.scene.show_point_lights);
+            self.queue
+                .write_buffer(&self.lights_buffer, 0, bytemuck::bytes_of(&lights));
         }
     }
 

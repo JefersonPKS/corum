@@ -95,9 +95,9 @@ Um mapa `N` é composto por arquivos em `Data\Map` (soltos ou dentro de `Map_stm
 | Arquivo | Conteúdo | Parser |
 |---|---|---|
 | `N.ttb` | grade de colisão/atributos de tiles | `ttb::TileMap` |
-| `N.map` | script textual: limites, referência ao `.stm`, objetos e luzes | `map_script::MapScript` (luzes ainda não) |
+| `N.map` | script textual: limites, referência ao `.stm`, objetos e luzes | `map_script::MapScript` (`GX_LIGHT` incluído) |
 | `N.stm` | geometria estática do cenário (posições, UVs, materiais, faces) | `stm::StaticModelFile` |
-| `N.vcl` | cor pré-calculada por vértice dos objetos STM tipo 1 | ainda sem parser (formato confirmado) |
+| `N.vcl` | cor pré-calculada por vértice dos objetos STM tipo 1 | `vcl::VertexColors` |
 | `N.lm` | lightmaps dos objetos STM tipo 3 | ainda sem parser (formato **não** decifrado) |
 | `N.lfg`, `N.ofg`, `N.hfl`, `N.am2`, `N.vch` | luzes/efeitos/altura/outros | não investigados |
 
@@ -130,7 +130,7 @@ GX_TRIGGER N { }
 ```
 
 - `GX_OBJECT`: `recurso` é `.MOD` (estático) ou `.CHR` (animado, ex.: `RD_BONFIRE.CHR`). `id` pode ser `4294967280` (`-16`). `flags` é uma string hexadecimal (`100000A`, `1000008`, `8`) ainda sem significado. O `1100` declara 0 objetos; outros mapas têm (ex.: `RD_BONFIRE.CHR`, `village_01.MOD`, este último com escala não uniforme).
-- `GX_LIGHT`: cor `AARRGGBB` em hexadecimal (`FF323296` = R 0x32, G 0x32, B 0x96), posição, raio e um inteiro sempre `1000` nas amostras. A contagem declarada inclui um registro terminador zerado (`0 0 0 0 0 1000`): o `1100` declara 21 e tem 20 luzes reais. O parser atual ignora esse bloco.
+- `GX_LIGHT`: cor `AARRGGBB` em hexadecimal (`FF323296` = R 0x32, G 0x32, B 0x96), posição, raio e um inteiro sempre `1000` nas amostras. A contagem declarada inclui um registro terminador zerado (`0 0 0 0 0 1000`): o `1100` declara 21 e tem 20 luzes reais. `MapScript::lights` já traz as luzes reais (sem o terminador); `MapLight::rgb()` converte a cor.
 - Coordenadas do `BOX_MIN/MAX` estão nas mesmas unidades do STM. No `1100`: `x -3172..6954`, `y -763..763`, `z 0..9140`.
 
 ### STM versão 1
@@ -174,9 +174,9 @@ O `1100` tem 11 objetos tipo 1 (22.157 vértices) e 9 tipo 3 (598 faces, 1.794 U
 - Objetos de tipo diferente de 1 e 3 vão para `skipped_objects`. Ainda não apareceram.
 - Alguns objetos trazem vértices com `0xCDCDCDCD` (`-431602080` como `f32`): memória não inicializada do exportador. No `1100` (objetos 0x39630, 0x6e2c2, 0x98992 e 0xc178c) nenhuma face os referencia. Quem renderiza deve descartar faces que os usem em vez de confiar nos limites do arquivo.
 
-### VCL — cor por vértice (confirmado)
+### VCL — cor por vértice (confirmado, parser em `vcl::VertexColors`)
 
-Sem cabeçalho: uma sequência de `u32` em `AARRGGBB` (na memória: bytes `B, G, R, A`; alfa `0xFF` nas amostras). No `1100`, `88.628 / 4 = 22.157` cores, exatamente a soma dos vértices dos objetos tipo 1. A hipótese de trabalho, a validar visualmente, é que as cores seguem a ordem dos objetos no arquivo `.stm` e, dentro de cada objeto, a ordem dos vértices. É a iluminação "assada" desses objetos, com tons neutros a levemente coloridos.
+Sem cabeçalho: uma sequência de `u32` em `AARRGGBB` (na memória: bytes `B, G, R, A`; alfa `0xFF` nas amostras). No `1100`, `88.628 / 4 = 22.157` cores, exatamente a soma dos vértices dos objetos tipo 1. As cores seguem a ordem dos objetos tipo 1 no `.stm` e, dentro de cada objeto, a ordem dos vértices. Isso foi verificado: a diferença média de luminância entre vértices ligados por uma aresta é 3,9, contra 16,6 entre pares aleatórios do mesmo objeto (o alfa é sempre `0xFF` e a luminância varia de 70 a 252). `corum-assets vcl-info <N.vcl> <N.stm>` confere a contagem. É a iluminação "assada" desses objetos, com tons neutros a levemente coloridos.
 
 ### LM — lightmaps (parcial)
 

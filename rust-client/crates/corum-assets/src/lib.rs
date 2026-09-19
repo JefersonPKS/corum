@@ -7,6 +7,7 @@ pub mod model;
 pub mod motion;
 pub mod stm;
 pub mod ttb;
+pub mod vcl;
 
 use std::fmt;
 use std::fs::{self, File};

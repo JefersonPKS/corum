@@ -52,6 +52,7 @@ Controles da sandbox:
 - `Tab` / `Shift+Tab`: inspecionar a próxima peça STM ou a anterior;
 - `0`: voltar a exibir todas as peças do cenário;
 - `F`: focar a câmera na peça selecionada;
+- `L`: ligar ou desligar as luzes pontuais do `GX_LIGHT`;
 - `G`: exibir ou ocultar a grade de colisão TTB;
 - `H`: exibir ou ocultar personagem e mob de teste;
 - botão esquerdo + arrastar: orbitar a câmera;
@@ -90,6 +91,11 @@ não for encontrado, cada material volta a ter uma cor estável por hash.
 
 Se o segundo argumento for omitido, a sandbox procura o `.stm` ao lado do `.ttb`.
 
+### Iluminação
+
+- **Cor por vértice (`.vcl`)**: os objetos tipo 1 recebem `textura × cor do VCL`, sem luz adicional, porque a cor já contém a iluminação pré-calculada. É o que dá às muralhas e rochas a variação de tom (verde, rosado, alaranjado). No `1100`, as 22.157 cores casam com os 22.157 vértices; se a contagem não bater, o arquivo é ignorado com um aviso.
+- **Luzes pontuais (`GX_LIGHT`)**: as 20 luzes do `.map` viram um buffer de uniformes (até 32), com atenuação quadrática até o raio de cada uma. Elas iluminam o que **não** tem cor pré-calculada: o personagem e o mob de teste, e os objetos tipo 3 (o chão principal), que ainda esperam o `.lm`. `L` compara com e sem luzes. Que as luzes do `.map` também sejam aplicadas em tempo de execução é uma **hipótese**: elas podem ter servido apenas para gerar o VCL/LM na ferramenta de mapas.
+
 ### Verificação visual automatizada
 
 `tools/capture-window.ps1` abre um binário, mexe na câmera (roda, arrasto, teclas) e salva a janela em PNG. Se a janela não ficar ativa, o script não envia nenhuma entrada e não captura. Exemplo, depois de `cargo build -p corum-viewer`:
@@ -98,14 +104,22 @@ Se o segundo argumento for omitido, a sandbox procura o `.stm` ao lado do `.ttb`
 .\tools\capture-window.ps1 -Out .\target\verification\shots\mapa -Wheel -14 -Drag -60
 ```
 
+O arrasto do mouse depende de onde o cursor estava, então o enquadramento varia entre execuções. Para comparações A/B, fixe a câmera com `CORUM_CAMERA=yaw,pitch,distância` (radianos, radianos, tiles; também vale para `R`) e alterne a tecla com `-Keys`:
+
+```powershell
+$env:CORUM_CAMERA = '0.3,0.55,14'
+.\tools\capture-window.ps1 -Out .\target\verification\shots\luz-on
+.\tools\capture-window.ps1 -Out .\target\verification\shots\luz-off -Keys 'l'
+Remove-Item Env:CORUM_CAMERA
+```
+
 ### O que ainda falta para o mapa ficar 100%
 
 O passo a passo (com ordem, critérios de aceite e riscos) está em [`docs/VISUAL_ROADMAP.md`](../../docs/VISUAL_ROADMAP.md). Resumo:
 
-- cor por vértice (`1100.vcl`, formato confirmado: 22.157 cores para os 22.157
-  vértices dos objetos tipo 1) e lightmaps (`1100.lm`, formato ainda não
-  decifrado; os objetos tipo 3 têm coordenadas de lightmap, hoje descartadas);
-- luzes pontuais do bloco `GX_LIGHT` do `.MAP` (21 no mapa `1100`);
+- lightmaps (`1100.lm`, formato ainda não decifrado; os objetos tipo 3 têm
+  coordenadas de lightmap, hoje descartadas). É o principal item de iluminação
+  que falta: o chão e o piso da arena ainda usam luz genérica;
 - objetos `GX_OBJECT` (`.MOD` posicionados) e efeitos `.ofg` (árvores, flores,
   fogo), presentes em outros mapas;
 - normais por vértice do `.STM` (hoje a normal é a da face);

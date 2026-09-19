@@ -44,6 +44,17 @@ pub struct SkippedStaticObject {
 }
 
 impl StaticModelFile {
+    /// Total vertices of the vertex-lit (type 1) objects, which is the number of colours
+    /// the matching `.vcl` must hold.
+    #[must_use]
+    pub fn vertex_lit_vertex_count(&self) -> usize {
+        self.objects
+            .iter()
+            .filter(|object| object.object_type == 1)
+            .map(|object| object.positions.len())
+            .sum()
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, StmError> {
         require(bytes, 0, FILE_HEADER_SIZE)?;
         let version = u32_at(bytes, 0)?;

@@ -104,9 +104,19 @@ fn run() -> Result<(), String> {
         &lights,
     )?;
     scene.props = load_props(&path, &scene.map);
-    scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
+    // `CORUM_PLAYER` names the body model directly; otherwise an outfit (`CORUM_CLASS`,
+    // `CORUM_ARMOR`, ...) builds the character, and with neither the default NPC stands in.
+    match Outfit::from_env().filter(|_| env::var_os("CORUM_PLAYER").is_none()) {
+        Some(outfit) => {
+            let (body, parts) = outfit.build(&path, tile_size);
+            scene.player_model = body;
+            scene.attachments = parts;
+        }
+        None => {
+            scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
+        }
+    }
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
-    scene.held_item = HeldItem::load(&path, scene.player_model.as_ref(), tile_size);
     // Debug: `CORUM_PLAYER_AT=x,z` starts the player at those map-script coordinates, to point
     // the camera at a specific spot in repeatable screenshots.
     if let Some([x, z]) = env::var("CORUM_PLAYER_AT").ok().and_then(|value| {
@@ -427,7 +437,8 @@ struct SandboxScene {
     show_props: bool,
     player_model: Option<ActorModel>,
     mob_model: Option<ActorModel>,
-    held_item: Option<HeldItem>,
+    /// Head, helmet, weapon and shield attached to bones of the player model.
+    attachments: Vec<Attachment>,
     player_yaw: f32,
     mob_yaw: f32,
     /// Multiplier for baked lighting (VCL and lightmaps): 1.0, or 2.0 to compare an
@@ -491,7 +502,7 @@ impl SandboxScene {
             show_props: true,
             player_model: None,
             mob_model: None,
-            held_item: None,
+            attachments: Vec::new(),
             player_yaw: 0.0,
             mob_yaw: 0.0,
             baked_gain: 1.0,
@@ -556,8 +567,10 @@ impl SandboxScene {
         }
         if let Some(model) = &mut self.player_model {
             model.animate(delta, self.moving);
-            if let (Some(rig), Some(held)) = (&model.rig, &mut self.held_item) {
-                held.follow(rig);
+            if let Some(rig) = &model.rig {
+                for part in &mut self.attachments {
+                    part.follow(rig);
+                }
             }
         }
         if let Some(model) = &mut self.mob_model {
@@ -659,8 +672,8 @@ impl SandboxScene {
         let (model, position, yaw) = match kind {
             ActorKind::Player => (self.player_model.as_ref(), self.player, self.player_yaw),
             ActorKind::Mob => (self.mob_model.as_ref(), self.mob, self.mob_yaw),
-            ActorKind::Held => (
-                self.held_item.as_ref().map(|held| &held.model),
+            ActorKind::Attached(index) => (
+                self.attachments.get(index).map(|part| &part.model),
                 self.player,
                 self.player_yaw,
             ),
@@ -1501,14 +1514,11 @@ impl Renderer {
                     .props
                     .iter()
                     .any(|batch| batch.vertices.iter().any(is_class))
-                || [
-                    scene.player_model.as_ref(),
-                    scene.mob_model.as_ref(),
-                    scene.held_item.as_ref().map(|held| &held.model),
-                ]
-                .into_iter()
-                .flatten()
-                .any(|model| model.vertices.iter().any(is_class))
+                || [scene.player_model.as_ref(), scene.mob_model.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .chain(scene.attachments.iter().map(|part| &part.model))
+                    .any(|model| model.vertices.iter().any(is_class))
         };
         let uses_blend = [has_class(BLEND_ALPHA), has_class(BLEND_ADDITIVE)];
         let vertex_capacity = scene.maximum_vertex_count();
@@ -1538,14 +1548,18 @@ impl Renderer {
             })
             .collect();
         let mut actors = Vec::new();
-        for (kind, model) in [
+        let attached = scene
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, part)| (ActorKind::Attached(index), Some(&part.model)));
+        let placed_actors = [
             (ActorKind::Player, scene.player_model.as_ref()),
             (ActorKind::Mob, scene.mob_model.as_ref()),
-            (
-                ActorKind::Held,
-                scene.held_item.as_ref().map(|held| &held.model),
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(attached);
+        for (kind, model) in placed_actors {
             let Some(model) = model else {
                 continue;
             };
@@ -1782,8 +1796,8 @@ impl DepthTarget {
 enum ActorKind {
     Player,
     Mob,
-    /// The item held in the player's hand, following a bone of the player's skeleton.
-    Held,
+    /// A part attached to a bone of the player's skeleton (head, helmet, weapon, shield).
+    Attached(usize),
 }
 
 /// A textured `.MOD` in sandbox units with the origin at its feet. Its vertices start in the
@@ -2113,50 +2127,37 @@ impl ActorModel {
     }
 }
 
-/// An item model (weapon) attached to a bone of the player's skeleton, like `ItemAttach` in the
-/// original client (`CodeFun.cpp`): the item's origin sits on the bone and moves with it.
-struct HeldItem {
+/// A model attached to a bone of the player's skeleton, like `ItemAttach` and the head attach of the
+/// original client (`CodeFun.cpp`, `DungeonProcess.cpp`): the model's pivot sits on the bone and
+/// moves with it.
+struct Attachment {
     model: ActorModel,
-    /// The item's vertices in its own space, before the bone matrix is applied.
+    /// The model's vertices in its own space, before the bone matrix is applied.
     local: Vec<Vertex>,
     bone: usize,
 }
 
-impl HeldItem {
-    /// Reads `CORUM_ITEM=<id>` (an item of the game tables), finds its model through
-    /// `ItemResource` and attaches it to `CORUM_ITEM_BONE` (default `Bip01 R Hand`, where the
-    /// client puts weapons). `CORUM_ITEM_MODEL` picks the model index (default 0).
-    fn load(ttb_path: &Path, player: Option<&ActorModel>, tile_size: f32) -> Option<Self> {
-        let id: u16 = env::var("CORUM_ITEM").ok()?.trim().parse().ok()?;
-        let rig = player?.rig.as_ref()?;
-        let bone_name = env::var("CORUM_ITEM_BONE").unwrap_or_else(|_| "Bip01 R Hand".to_owned());
-        let Some(bone) = rig.skeleton.index_of_name(&bone_name) else {
-            eprintln!("CORUM_ITEM: the player model has no bone `{bone_name}`");
+impl Attachment {
+    /// Loads `entry` from the first of `packages` that has it and attaches it to `bone_name`.
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        ttb_path: &Path,
+        rig: &Rig,
+        bone_name: &str,
+        label: &str,
+        packages: &[&str],
+        entry: &str,
+        tile_size: f32,
+    ) -> Option<Self> {
+        let Some(bone) = rig.skeleton.index_of_name(bone_name) else {
+            eprintln!("{label}: the player model has no bone `{bone_name}`");
             return None;
         };
-        let index: u16 = env::var("CORUM_ITEM_MODEL")
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0);
-        let directory = data_directories(ttb_path)
-            .into_iter()
-            .find(|directory| directory.join("Manager").join("ItemResource.cdb").is_file())?;
-        let catalog = ItemCatalog::load(&directory.join("Manager"))
-            .map_err(|error| eprintln!("CORUM_ITEM: {error}"))
-            .ok()?;
-        let name = catalog
-            .items
-            .get(&id)
-            .map_or_else(String::new, |item| item.name_eng.lossy());
-        let Some(entry) = catalog.model_entry(id, index) else {
-            eprintln!("CORUM_ITEM: item {id} ({name}) has no 3D model");
-            return None;
-        };
-        for package in ["Item", "Character"] {
+        for package in packages {
             let Ok(archive) = open_data_package(ttb_path, package) else {
                 continue;
             };
-            let Ok(mut bytes) = archive.read_entry(&entry) else {
+            let Ok(mut bytes) = archive.read_entry(entry) else {
                 continue;
             };
             // Animated items (`.chr`) are a manifest that names the `.mod`; the sandbox shows
@@ -2166,16 +2167,16 @@ impl HeldItem {
                     continue;
                 };
                 let Ok(model_bytes) = archive.read_entry(&manifest.model_file) else {
-                    eprintln!("CORUM_ITEM: {} is not in {package}", manifest.model_file);
+                    eprintln!("{label}: {} is not in {package}", manifest.model_file);
                     continue;
                 };
                 bytes = model_bytes;
             }
-            let packages = TexturePackages {
+            let textures = TexturePackages {
                 dds: vec![archive.clone()],
                 tif: vec![archive],
             };
-            match ActorModel::from_bytes(&bytes, &packages, tile_size, false) {
+            match ActorModel::from_bytes(&bytes, &textures, tile_size, false) {
                 Ok(model) => {
                     // The model is authored away from the origin: the engine fixes the pivot of
                     // its node (the node's world translation) to the bone, so the vertices are
@@ -2202,24 +2203,27 @@ impl HeldItem {
                         })
                         .collect();
                     eprintln!(
-                        "holding item {id} \"{name}\": {package}/{entry} on `{bone_name}`, {} triangles",
+                        "{label}: {package}/{entry} on `{bone_name}`, {} triangles",
                         model.vertices.len() / 3
                     );
                     return Some(Self { model, local, bone });
                 }
-                Err(error) => eprintln!("CORUM_ITEM: {entry}: {error}"),
+                Err(error) => eprintln!("{label}: {entry}: {error}"),
             }
         }
-        eprintln!("CORUM_ITEM: {entry} is not in the Item or Character packages");
+        eprintln!(
+            "{label}: {entry} is not in the {} package(s)",
+            packages.join("/")
+        );
         None
     }
 
-    /// Moves the item with its bone in the player's current pose.
+    /// Moves the model with its bone in the player's current pose.
     fn follow(&mut self, rig: &Rig) {
         let Some(mut matrix) = rig.pose.get(self.bone).copied() else {
             return;
         };
-        // The bone matrix is in model units; the item's vertices already are in sandbox units.
+        // The bone matrix is in model units; the model's vertices already are in sandbox units.
         for value in &mut matrix[3][..3] {
             *value *= rig.scale;
         }
@@ -2227,6 +2231,158 @@ impl HeldItem {
             placed.position = transform_point(&matrix, local.position);
             placed.normal = transform_vector(&matrix, local.normal);
         }
+    }
+}
+
+/// Base body of a class when no armor is worn (`RESTYPE_BASE_BODY`, `pm0<class>000`).
+fn base_body_entry(class: u16) -> String {
+    format!("pm{class:02}000.mod")
+}
+
+/// Head model: `RESTYPE_HEAD_MALE` for classes below 4, `_FEMALE` otherwise; the head id `1001`
+/// names `ph101001.mod` (and `ph201001.mod` for the female ones).
+fn head_entry(class: u16, head: u16) -> String {
+    let sex = if class < 4 { 1 } else { 2 };
+    format!("ph{sex}0{head}.mod")
+}
+
+/// A number from an environment variable.
+fn env_number(name: &str) -> Option<u16> {
+    env::var(name).ok()?.trim().parse().ok()
+}
+
+/// What the character wears, as the appearance packet of the original client describes it
+/// (`DungeonProcess.cpp`): `wArmor` is the whole **body** model, `wHead` the head model, `wHelmet`
+/// sits on the head bone, `wHandR` and `wHandL` on the hands. Read from `CORUM_CLASS` (1 warrior,
+/// 2 priest, 3 summoner, 4 hunter, 5 wizard), `CORUM_ARMOR`, `CORUM_HEAD`, `CORUM_HELMET`,
+/// `CORUM_ITEM` (right hand) and `CORUM_SHIELD` (left hand); `None` when none is set.
+struct Outfit {
+    class: u16,
+    armor: u16,
+    head: u16,
+    helmet: u16,
+    right: u16,
+    left: u16,
+}
+
+impl Outfit {
+    fn from_env() -> Option<Self> {
+        let names = [
+            "CORUM_CLASS",
+            "CORUM_ARMOR",
+            "CORUM_HEAD",
+            "CORUM_HELMET",
+            "CORUM_ITEM",
+            "CORUM_SHIELD",
+        ];
+        names
+            .iter()
+            .any(|name| env::var_os(name).is_some())
+            .then(|| Self {
+                class: env_number("CORUM_CLASS").unwrap_or(1).clamp(1, 5),
+                armor: env_number("CORUM_ARMOR").unwrap_or(0),
+                head: env_number("CORUM_HEAD").unwrap_or(0),
+                helmet: env_number("CORUM_HELMET").unwrap_or(0),
+                right: env_number("CORUM_ITEM").unwrap_or(0),
+                left: env_number("CORUM_SHIELD").unwrap_or(0),
+            })
+    }
+
+    /// Builds the body and the parts attached to it.
+    fn build(&self, ttb_path: &Path, tile_size: f32) -> (Option<ActorModel>, Vec<Attachment>) {
+        let catalog = data_directories(ttb_path)
+            .into_iter()
+            .find(|directory| directory.join("Manager").join("ItemResource.cdb").is_file())
+            .and_then(|directory| {
+                ItemCatalog::load(&directory.join("Manager"))
+                    .map_err(|error| eprintln!("outfit: {error}"))
+                    .ok()
+            });
+        let name_of = |id: u16| {
+            catalog
+                .as_ref()
+                .and_then(|catalog| catalog.items.get(&id))
+                .map_or_else(String::new, |item| item.name_eng.lossy())
+        };
+        // No armor: the base body of the class (`RESTYPE_BASE_BODY`, `pm0<class>000`).
+        // Armor: `ItemDataName(armor, class - 1)`, that is `<model>_<class - 1, 3 digits>.mod`.
+        let body_entry = if self.armor == 0 {
+            Some(base_body_entry(self.class))
+        } else {
+            catalog
+                .as_ref()
+                .and_then(|catalog| catalog.model_entry(self.armor, self.class - 1))
+        };
+        // A body item is a `.chr` (manifest + motions): load the `.mod` of the same name, the
+        // sandbox finds the sibling `.chr` for the motions.
+        let body_entry = body_entry.map(|entry| entry.replace(".chr", ".mod"));
+        let body = body_entry.and_then(|entry| {
+            eprintln!(
+                "outfit: class {} armor {} \"{}\" -> Character/{entry}",
+                self.class,
+                self.armor,
+                name_of(self.armor)
+            );
+            ActorModel::load(
+                ttb_path,
+                "Character",
+                &entry,
+                tile_size,
+                "CORUM_PLAYER_ANIM",
+            )
+            .map_err(|error| eprintln!("outfit: body {entry}: {error}"))
+            .ok()
+        });
+        let mut parts = Vec::new();
+        let Some(rig) = body.as_ref().and_then(|body| body.rig.as_ref()) else {
+            return (body, parts);
+        };
+        // Heads: `RESTYPE_HEAD_MALE` for classes below 4, `_FEMALE` otherwise; the id `1001`
+        // names `ph101001.mod` (`ph2...` for the female heads).
+        if self.head != 0 {
+            let entry = head_entry(self.class, self.head);
+            parts.extend(Attachment::load(
+                ttb_path,
+                rig,
+                "Bip01 Head",
+                "head",
+                &["Character"],
+                &entry,
+                tile_size,
+            ));
+        }
+        let item_parts = [
+            (self.helmet, "Bip01 Head", "helmet", "CORUM_HELMET_MODEL"),
+            (self.right, "Bip01 R Hand", "right hand", "CORUM_ITEM_MODEL"),
+            (self.left, "Bip01 L Hand", "left hand", "CORUM_SHIELD_MODEL"),
+        ];
+        for (id, default_bone, label, model_variable) in item_parts {
+            if id == 0 {
+                continue;
+            }
+            let bone = if label == "right hand" {
+                env::var("CORUM_ITEM_BONE").unwrap_or_else(|_| default_bone.to_owned())
+            } else {
+                default_bone.to_owned()
+            };
+            let label = format!("{label} item {id} \"{}\"", name_of(id));
+            let Some(entry) = catalog.as_ref().and_then(|catalog| {
+                catalog.model_entry(id, env_number(model_variable).unwrap_or(0))
+            }) else {
+                eprintln!("{label}: no 3D model");
+                continue;
+            };
+            parts.extend(Attachment::load(
+                ttb_path,
+                rig,
+                &bone,
+                &label,
+                &["Item", "Character"],
+                &entry,
+                tile_size,
+            ));
+        }
+        (body, parts)
     }
 }
 
@@ -2932,6 +3088,16 @@ mod tests {
             height: 1,
             rgba: texels.iter().flatten().copied().collect(),
         }
+    }
+
+    #[test]
+    fn character_parts_use_the_original_client_names() {
+        // `RESTYPE_BASE_BODY`: one base body per class; heads: male below class 4, female above.
+        assert_eq!(base_body_entry(1), "pm01000.mod");
+        assert_eq!(base_body_entry(5), "pm05000.mod");
+        assert_eq!(head_entry(1, 1001), "ph101001.mod");
+        assert_eq!(head_entry(3, 1022), "ph101022.mod");
+        assert_eq!(head_entry(4, 1001), "ph201001.mod");
     }
 
     #[test]

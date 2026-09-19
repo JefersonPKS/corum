@@ -368,6 +368,31 @@ fn item_check(data: &str) -> Result<(), String> {
         "{:20} {:6} {:9} {:11} {:12}",
         "total", total[0], total[1], total[2], total[3]
     );
+    // Body armors (`pm<NNNN>` models) are named per class: the class index is `class - 1`.
+    let body_armors: Vec<u16> = catalog
+        .items
+        .values()
+        .filter(|item| item.table == "ItemArmor")
+        .filter(|item| {
+            catalog
+                .resources
+                .get(&item.id)
+                .is_some_and(|resource| resource.model_file.lossy().starts_with("pm"))
+        })
+        .map(|item| item.id)
+        .collect();
+    println!("body armors (pm models): {}", body_armors.len());
+    for class in 1..=5u16 {
+        let wearable = body_armors
+            .iter()
+            .filter(|id| {
+                catalog
+                    .model_entry(**id, class - 1)
+                    .is_some_and(|entry| packages.iter().any(|pak| pak.read_entry(&entry).is_ok()))
+            })
+            .count();
+        println!("  class {class}: {wearable} wearable");
+    }
     Ok(())
 }
 

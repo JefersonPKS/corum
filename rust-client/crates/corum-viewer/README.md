@@ -183,6 +183,15 @@ olhe para o lado errado). Verificados na tela: `npc007`, `npc012`, `m00010` e `m
 - **Luzes pontuais (`GX_LIGHT`)**: as luzes do `.map` (20 no `1100`, 141 no `101`) vão para um buffer de uniformes (até 256), com atenuação quadrática até o raio. Como as poças de luz dos lightmaps e do VCL têm cores compatíveis com as do `.map` (azul, roxo, verde, laranja; correspondência visual, não medida posição a posição), as luzes parecem ter sido *assadas* na geração dos arquivos; por isso o cenário não as recebe de novo, e elas só iluminam o personagem e o mob de teste. `L` compara com e sem elas.
 - **Ganho (`B`)**: com ×1, os pontos claros do VCL e do lightmap chegam a 252/255 e `0xFFFF`, o que indica que ×1 é o valor de projeto (×2 estouraria). É uma inferência: só o cliente original rodando decide.
 
+### Clique para andar (2026-09-19)
+
+- **Controle:** um **clique esquerdo** sem arrasto (o cursor move menos de 5 pixels entre apertar e soltar) manda o personagem andar até o ponto do chão sob o cursor; **arrastar** continua orbitando a câmera. `WASD`/setas cancelam a rota e voltam ao controle manual. `Shift` faz a viagem correr (só a velocidade: 6,0 em vez de 3,3 tiles/s; a animação usada é a de andar). Um marcador amarelo mostra o destino até chegar; o personagem para no fim, volta ao movimento parado e a câmera o acompanha.
+- **Mira:** o raio do pixel clicado (matriz inversa da câmera, profundidade estilo Direct3D 0..1) é cortado com o plano do chão (`y` do personagem). Coberto por teste: projetar o ponto do chão de volta devolve o pixel.
+- **Rota:** `corum_assets::navigation::find_path` (A* de 8 direções sobre os tiles caminháveis do `.ttb`, sem cortar quinas, com alisamento por linha de visão para o raio do corpo, 0,20 tile). Um clique em tile bloqueado gruda no tile livre mais próximo (até 3 tiles); destino fora do mapa ou isolado dá "no route" no terminal e o personagem fica parado. O log mostra `walk: N waypoint(s) to tile (x, z)`.
+- **Diferença do original [hipótese]:** o cliente usa o módulo de busca `FindShortestWay` (em DLL) e anda entre os pontos de curva devolvidos (`A_STAR`, `DungeonProcess.cpp`); o resultado daqui é equivalente em espírito, mas o traçado exato pode variar.
+- **Altura do terreno:** os mapas com `HEIGHT_FIELD NA` (a maioria, inclusive `1100`) são planos e o personagem anda em `y = 0`. Só há 5 arquivos `.hfl` (`10001`, `10002`, `property`, `property02`, `worldmap2`), ligados a mapas de mundo; o formato não foi decifrado (ver o README do `corum-assets`).
+- **Verificação:** `tools/capture-window.ps1 -Click "0.85,0.2" -ClickWait 0.1` clica numa fração da janela e captura logo depois. Com `CORUM_CLASS=1 CORUM_ARMOR=2200 CORUM_HEAD=1001 CORUM_ITEM=1 CORUM_CAMERA=0.6,0.9,9` o personagem vestido anda até o marcador.
+
 ### Verificação visual automatizada
 
 `tools/capture-window.ps1` abre um binário, mexe na câmera (roda, arrasto, teclas) e salva a janela em PNG. Se a janela não ficar ativa, o script não envia nenhuma entrada e não captura. Exemplo, depois de `cargo build -p corum-viewer`:

@@ -17,11 +17,12 @@ use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::{MapLight, MapObject, MapScript};
 use corum_assets::model::{Matrix, ModelFile};
 use corum_assets::motion::MotionFile;
+use corum_assets::navigation;
 use corum_assets::pose::{Skeleton, transform_point, transform_vector};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
 use corum_assets::vcl::VertexColors;
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -53,6 +54,11 @@ const TRANSLUCENT_PARTIAL_FRACTION: f32 = 0.6;
 const BLACK_KEYED_FRACTION: f32 = 0.7;
 /// Rotation (radians) added to the movement heading so a model's front faces where it walks.
 const ACTOR_YAW_OFFSET: f32 = 0.0;
+/// Pixels the cursor may move between press and release for the click to still be a move order
+/// (a longer drag orbits the camera instead).
+const CLICK_DRAG_LIMIT: f32 = 5.0;
+/// Radius, in tiles, of the player's body when walking and planning routes.
+const PLAYER_RADIUS: f32 = 0.20;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 fn main() {
@@ -313,7 +319,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         format!(
-            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
+            "Corum Map Viewer — {} — {} — clique: andar | Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("map.ttb"),
@@ -378,7 +384,15 @@ impl ApplicationHandler for SandboxApplication {
                 button: MouseButton::Left,
                 ..
             } => {
-                renderer.camera.dragging = state == ElementState::Pressed;
+                let pressed = state == ElementState::Pressed;
+                if pressed {
+                    renderer.camera.drag_distance = 0.0;
+                }
+                renderer.camera.dragging = pressed;
+                // A click that did not turn into a drag is a move order (as in the original client).
+                if !pressed && renderer.camera.drag_distance < CLICK_DRAG_LIMIT {
+                    renderer.click_to_move();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => renderer.camera.cursor_moved(position),
             WindowEvent::MouseWheel { delta, .. } => renderer.camera.zoom(delta),
@@ -451,6 +465,8 @@ struct SandboxScene {
     input: MovementInput,
     elapsed: f32,
     moving: bool,
+    /// Points still to walk to, in sandbox coordinates (the click-to-move route).
+    route: Vec<Vec2>,
 }
 
 impl SandboxScene {
@@ -513,6 +529,7 @@ impl SandboxScene {
             input: MovementInput::default(),
             elapsed: 0.0,
             moving: false,
+            route: Vec::new(),
         })
     }
 
@@ -540,8 +557,16 @@ impl SandboxScene {
             f32::from(self.input.right) - f32::from(self.input.left),
             f32::from(self.input.forward) - f32::from(self.input.backward),
         );
-        self.moving = input.length_squared() > 0.0;
-        if self.moving {
+        let keyboard = input.length_squared() > 0.0;
+        if keyboard {
+            // Steering by hand cancels a click-to-move route.
+            self.route.clear();
+        }
+        self.moving = keyboard || !self.route.is_empty();
+        if !keyboard {
+            self.follow_route(delta);
+        }
+        if keyboard {
             input = input.normalize();
             let forward = Vec3::new(-camera_yaw.sin(), 0.0, -camera_yaw.cos());
             let right = Vec3::new(forward.z, 0.0, -forward.x);
@@ -575,6 +600,66 @@ impl SandboxScene {
         }
         if let Some(model) = &mut self.mob_model {
             model.animate(delta, true);
+        }
+    }
+
+    /// Sandbox coordinates (tiles centred on the map) to map tile coordinates.
+    fn to_tile_space(&self, point: Vec3) -> [f32; 2] {
+        [
+            point.x + self.map.width as f32 * 0.5,
+            point.z + self.map.height as f32 * 0.5,
+        ]
+    }
+
+    /// Plans a route to `target` over the walkable tiles and starts walking it.
+    fn walk_to(&mut self, target: Vec3) {
+        let path = navigation::find_path(
+            &self.map,
+            self.to_tile_space(self.player),
+            self.to_tile_space(target),
+            PLAYER_RADIUS,
+        );
+        match path {
+            Some(points) => {
+                eprintln!(
+                    "walk: {} waypoint(s) to tile ({:.1}, {:.1})",
+                    points.len(),
+                    points.last().map_or(0.0, |point| point[0]),
+                    points.last().map_or(0.0, |point| point[1])
+                );
+                let half = Vec2::new(self.map.width as f32, self.map.height as f32) * 0.5;
+                self.route = points
+                    .iter()
+                    .map(|point| Vec2::new(point[0], point[1]) - half)
+                    .collect();
+            }
+            None => {
+                eprintln!("walk: no route to that spot");
+                self.route.clear();
+            }
+        }
+    }
+
+    /// Walks toward the next route point; stops if the way is blocked.
+    fn follow_route(&mut self, delta: f32) {
+        let Some(next) = self.route.first().copied() else {
+            return;
+        };
+        let here = Vec2::new(self.player.x, self.player.z);
+        let offset = next - here;
+        let step = if self.input.run { 6.0 } else { 3.3 } * delta;
+        if offset.length() <= step {
+            self.player.x = next.x;
+            self.player.z = next.y;
+            self.route.remove(0);
+            return;
+        }
+        let direction = offset.normalize();
+        let before = self.player;
+        self.move_player(Vec3::new(direction.x, 0.0, direction.y) * step);
+        if (self.player - before).length() < step * 0.25 {
+            // Blocked (a moving obstacle or rounding at a corner): give up instead of pushing.
+            self.route.clear();
         }
     }
 
@@ -654,6 +739,15 @@ impl SandboxScene {
             if self.player_model.is_none() {
                 add_humanoid(&mut vertices, self.player + Vec3::Y * bob);
             }
+            if let Some(destination) = self.route.last() {
+                add_pyramid(
+                    &mut vertices,
+                    Vec3::new(destination.x, 0.0, destination.y),
+                    0.12,
+                    0.35,
+                    [1.0, 0.85, 0.2],
+                );
+            }
             if self.mob_model.is_none() {
                 add_mob(
                     &mut vertices,
@@ -696,7 +790,7 @@ impl SandboxScene {
     }
 
     fn maximum_vertex_count(&self) -> usize {
-        self.stm_vertices.len() + self.map_vertices.len() + 200
+        self.stm_vertices.len() + self.map_vertices.len() + 200 + 64
     }
 
     fn select_object(&mut self, direction: isize) {
@@ -1235,6 +1329,8 @@ struct Camera {
     pitch: f32,
     distance: f32,
     dragging: bool,
+    /// Pixels the cursor has travelled since the button went down.
+    drag_distance: f32,
     last_cursor: Option<PhysicalPosition<f64>>,
 }
 
@@ -1261,6 +1357,7 @@ impl Camera {
             pitch,
             distance,
             dragging: false,
+            drag_distance: 0.0,
             last_cursor: None,
         }
     }
@@ -1269,6 +1366,8 @@ impl Camera {
         if self.dragging
             && let Some(previous) = self.last_cursor
         {
+            self.drag_distance +=
+                ((position.x - previous.x).abs() + (position.y - previous.y).abs()) as f32;
             self.yaw -= (position.x - previous.x) as f32 * 0.008;
             self.pitch = (self.pitch + (position.y - previous.y) as f32 * 0.008).clamp(0.08, 1.48);
         }
@@ -1303,6 +1402,20 @@ impl Camera {
             light_direction: [-0.35, 0.75, 0.55, 0.0],
         }
     }
+}
+
+/// Where the ray through `ndc` (normalised device coordinates, y up) meets the plane `y = ground`.
+/// The projection has Direct3D-style depth: 0 at the near plane, 1 at the far plane.
+fn unproject_to_ground(view_projection: [[f32; 4]; 4], ndc: Vec2, ground: f32) -> Option<Vec3> {
+    let inverse = Mat4::from_cols_array_2d(&view_projection).inverse();
+    let near = inverse.project_point3(ndc.extend(0.0));
+    let far = inverse.project_point3(ndc.extend(1.0));
+    let direction = far - near;
+    if direction.y.abs() < 1e-6 {
+        return None;
+    }
+    let along = (ground - near.y) / direction.y;
+    (along > 0.0).then(|| near + direction * along)
 }
 
 struct Renderer {
@@ -1602,6 +1715,27 @@ impl Renderer {
             scene,
             previous_frame: Instant::now(),
         })
+    }
+
+    /// Where the cursor's ray meets the ground plane (the player's height), in sandbox coordinates.
+    fn ground_under_cursor(&self) -> Option<Vec3> {
+        let cursor = self.camera.last_cursor?;
+        let (width, height) = (self.config.width as f32, self.config.height as f32);
+        if width < 1.0 || height < 1.0 {
+            return None;
+        }
+        let ndc = Vec2::new(
+            2.0 * cursor.x as f32 / width - 1.0,
+            1.0 - 2.0 * cursor.y as f32 / height,
+        );
+        let view_projection = self.camera.uniform(width / height).view_projection;
+        unproject_to_ground(view_projection, ndc, self.scene.player.y)
+    }
+
+    fn click_to_move(&mut self) {
+        if let Some(target) = self.ground_under_cursor() {
+            self.scene.walk_to(target);
+        }
     }
 
     fn reset_camera(&mut self) {
@@ -3088,6 +3222,39 @@ mod tests {
             height: 1,
             rgba: texels.iter().flatten().copied().collect(),
         }
+    }
+
+    #[test]
+    fn the_cursor_ray_lands_on_the_ground_under_the_pixel() {
+        let camera = Camera {
+            target: Vec3::new(3.0, 0.7, -2.0),
+            yaw: 0.6,
+            pitch: 0.9,
+            distance: 9.0,
+            dragging: false,
+            drag_distance: 0.0,
+            last_cursor: None,
+        };
+        let view_projection = camera.uniform(1.4).view_projection;
+        let matrix = Mat4::from_cols_array_2d(&view_projection);
+        for ndc in [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.6, 0.4),
+            Vec2::new(-0.8, -0.5),
+        ] {
+            let hit =
+                unproject_to_ground(view_projection, ndc, 0.0).expect("looking down at the ground");
+            assert!(hit.y.abs() < 1e-3, "{hit:?}");
+            // Projecting the hit point again must give the same pixel back.
+            let clip = matrix * hit.extend(1.0);
+            let back = Vec2::new(clip.x / clip.w, clip.y / clip.w);
+            assert!(
+                (back - ndc).length() < 1e-3,
+                "{ndc:?} -> {hit:?} -> {back:?}"
+            );
+        }
+        // A ray that looks at the sky never meets the ground.
+        assert!(unproject_to_ground(view_projection, Vec2::new(0.0, 1.0), 40.0).is_none());
     }
 
     #[test]

@@ -21,6 +21,8 @@
 .PARAMETER Wheel   Passos da roda do mouse (negativo afasta a câmera).
 .PARAMETER Drag    Pixels de arrasto vertical com o botão esquerdo (orbita a câmera).
 .PARAMETER Keys    Texto para SendKeys (ex.: '{TAB}', '0', 'g').
+.PARAMETER Click   Clique esquerdo em "fx,fy" (frações da janela, ex.: '0.7,0.6'); no sandbox vira uma ordem de andar.
+.PARAMETER ClickWait  Segundos de espera depois do clique, antes de capturar (padrão 2).
 #>
 param(
     [Parameter(Mandatory = $true)][string]$Out,
@@ -29,7 +31,9 @@ param(
     [int]$Wait = 8,
     [int]$Wheel = 0,
     [int]$Drag = 0,
-    [string]$Keys = ''
+    [string]$Keys = '',
+    [string]$Click = '',
+    [double]$ClickWait = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,6 +101,18 @@ try {
         Start-Sleep -Milliseconds 40
     }
     if ($Keys -ne '') { [System.Windows.Forms.SendKeys]::SendWait($Keys) }
+    if ($Click -ne '') {
+        $parts = $Click.Split(',')
+        $fx = [double]::Parse($parts[0], [Globalization.CultureInfo]::InvariantCulture)
+        $fy = [double]::Parse($parts[1], [Globalization.CultureInfo]::InvariantCulture)
+        [CorumWin]::GetWindowRect($handle, [ref]$rect) | Out-Null
+        [CorumWin]::SetCursorPos($rect.L + [int](($rect.R - $rect.L) * $fx), $rect.T + [int](($rect.B - $rect.T) * $fy)) | Out-Null
+        Start-Sleep -Milliseconds 300
+        [CorumWin]::mouse_event(0x2, 0, 0, 0, 0)
+        Start-Sleep -Milliseconds 60
+        [CorumWin]::mouse_event(0x4, 0, 0, 0, 0)
+        Start-Sleep -Milliseconds ([int]($ClickWait * 1000))
+    }
     Start-Sleep -Milliseconds 800
 
     [CorumWin]::GetWindowRect($handle, [ref]$rect) | Out-Null

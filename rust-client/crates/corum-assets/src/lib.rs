@@ -10,6 +10,7 @@ pub mod lightmap;
 pub mod map_script;
 pub mod model;
 pub mod motion;
+pub mod navigation;
 pub mod pose;
 pub mod schema;
 pub mod stm;

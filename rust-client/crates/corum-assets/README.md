@@ -415,6 +415,12 @@ Como o cliente original acha o modelo de um item (`ItemDataName` e `ItemAttach`,
 - **Armaduras vestíveis por classe** (`item-check`): 311 armaduras de corpo (`pm…`); têm modelo para a classe 1: 231, classe 2: 242, classe 3: 235, classe 4: 241, classe 5: 247 (as demais são de outra classe).
 - **Limites:** itens `.chr` são mostrados na pose de bind, sem o `.anm` próprio; o item `812` (garra "Marbes' Death Fist") tem uma malha de layout ainda não decifrado (das ~150 conhecidas) e só o plano `add1` aparece.
 
+## Navegação e altura do terreno (2026-09-19)
+
+- **Caminho (`navigation`):** `find_path(mapa, de, para, raio)` em unidades de tile: A* em 8 direções sobre os tiles com `TileAttribute::is_walkable`, sem cortar quinas (as duas vizinhas ortogonais de uma diagonal também têm de ser livres), custos 1000/1414 e heurística octile; depois um alisamento por linha de visão (amostras de 0,1 tile, quatro cantos do corpo) deixa só as curvas. Destino em tile bloqueado gruda no livre mais próximo (até 3 tiles); fora do mapa ou isolado devolve `None`. Cobertura: testes sintéticos (campo aberto, parede, ilha, quina) e um teste com o mapa real `1100` (200 pares de tiles: todo caminho achado tem trechos livres e termina no tile do destino; exige `CORUM_DATA`).
+- **Original [hipótese]:** o cliente chama `g_pSw->FindShortestWay` (módulo em DLL) e devolve pontos de curva (`A_STAR`); o traçado exato do original não foi comparado.
+- **Altura (`.hfl`, não decifrado):** só 5 arquivos (`10001.hfl`, `10002.hfl`, `property.hfl`, `property02.hfl`, `worldmap2.hfl`, 150–224 KB), referenciados por `HEIGHT_FIELD` nos `.map` de alguns mapas de mundo; a maioria dos mapas usa `HEIGHT_FIELD NA` (chão plano). Cabeçalho observado (`u32`/`f32` little-endian): `1`, `0`, `0`, `15360.0`, `15360.0`, `80.0` (extensões em unidades do mapa e altura máxima **[hipótese]**), depois `0x40` (ou `0x20`) e `3` (ou `6`) repetido, seguidos do corpo. Nada disso foi validado contra o cliente.
+
 ## Tabelas de recursos `.erd` (módulo `erd`, 2026-09-19)
 
 `CorumResource.erd` e `DefResource.erd` (raiz do cliente) ligam **id de recurso → caminho de arquivo**, como os comentários de `CorumOnlineProject/DefResource.h` sugerem (`167782161 // .\Data\Map\worldmap1.cdb`).

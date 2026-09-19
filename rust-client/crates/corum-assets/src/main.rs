@@ -606,7 +606,12 @@ fn skin_difference(
                 let Some(bone) = skeleton.index_of_id(influence.bone_id) else {
                     continue;
                 };
-                let point = transform_point(&pose[bone], influence.offset);
+                // Match the renderer: model positions are stored in bind/world space and
+                // each influence moves that position with `inverse_bind * posed_world`.
+                // The per-influence `offset` field is a separate legacy payload; using it
+                // here would not reproduce the actual skinning path used by the client.
+                let skin_matrix = skeleton.rigid_matrix(bone, pose);
+                let point = transform_point(&skin_matrix, geometry.positions[index]);
                 for axis in 0..3 {
                     sum[axis] += influence.weight * point[axis];
                 }

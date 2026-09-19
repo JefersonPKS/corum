@@ -360,6 +360,13 @@ name = "corum-assets"
 version = "0.1.0"
 
 [[package]]
+name = "corum-net"
+version = "0.1.0"
+dependencies = [
+ "corum-wire",
+]
+
+[[package]]
 name = "corum-viewer"
 version = "0.1.0"
 dependencies = [

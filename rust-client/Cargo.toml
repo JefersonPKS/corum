@@ -1,3 +1,8 @@
 [workspace]
-members = ["crates/corum-assets", "crates/corum-viewer", "crates/corum-wire"]
+members = [
+    "crates/corum-assets",
+    "crates/corum-viewer",
+    "crates/corum-net",
+    "crates/corum-wire",
+]
 resolver = "3"

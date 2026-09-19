@@ -12,6 +12,7 @@ use corum_assets::PakArchive;
 use corum_assets::dds::DecodedImage;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::{MapLight, MapScript};
+use corum_assets::model::ModelFile;
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
 use corum_assets::vcl::VertexColors;
@@ -26,6 +27,11 @@ use winit::window::{Window, WindowId};
 
 const DEFAULT_MAP: &str = r"D:\Games\CorumOnline\Data\Map\1100.ttb";
 const DEFAULT_DATA_DIRECTORY: &str = r"D:\Games\CorumOnline\Data";
+/// Default actors as `Package/entry`; override with `CORUM_PLAYER` and `CORUM_MOB`.
+const DEFAULT_PLAYER_MODEL: &str = "Npc/npc007.mod";
+const DEFAULT_MOB_MODEL: &str = "Monster/m00010.mod";
+/// Rotation (radians) added to the movement heading so a model's front faces where it walks.
+const ACTOR_YAW_OFFSET: f32 = 0.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 fn main() {
@@ -68,18 +74,46 @@ fn run() -> Result<(), String> {
     }
     let baked = load_baked_colors(&path, static_model.as_ref());
     let lights = load_lights(&path);
-    let scene = SandboxScene::new(
+    let tile_size = map.tile_size as f32;
+    let mut scene = SandboxScene::new(
         map,
         static_model.as_ref(),
         &textures,
         baked.as_ref(),
         &lights,
     )?;
+    scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
+    scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
     let event_loop = EventLoop::new().map_err(|error| error.to_string())?;
     let mut application = SandboxApplication::new(path, scene, textures);
     event_loop
         .run_app(&mut application)
         .map_err(|error| error.to_string())
+}
+
+/// Loads the actor named by `variable` (or `default`), given as `Package/entry`. A model that
+/// cannot be found falls back to the placeholder boxes.
+fn load_actor(
+    ttb_path: &Path,
+    variable: &str,
+    default: &str,
+    tile_size: f32,
+) -> Option<ActorModel> {
+    let spec = env::var(variable).unwrap_or_else(|_| default.to_owned());
+    if spec.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let Some((package, entry)) = spec.split_once('/') else {
+        eprintln!("{variable}='{spec}' must look like Package/entry.mod");
+        return None;
+    };
+    match ActorModel::load(ttb_path, package, entry, tile_size) {
+        Ok(model) => Some(model),
+        Err(error) => {
+            eprintln!("actor {spec} unavailable: {error}");
+            None
+        }
+    }
 }
 
 /// Reads `<map>.<extension>` next to the `.ttb`, or else from `Data\Map_light\Map_light.pak`,
@@ -328,6 +362,10 @@ struct SandboxScene {
     show_collision: bool,
     show_entities: bool,
     show_point_lights: bool,
+    player_model: Option<ActorModel>,
+    mob_model: Option<ActorModel>,
+    player_yaw: f32,
+    mob_yaw: f32,
     /// Multiplier for baked lighting (VCL and lightmaps): 1.0, or 2.0 to compare an
     /// over-bright (`MODULATE2X`-style) interpretation. Toggled with `B`.
     baked_gain: f32,
@@ -385,6 +423,10 @@ impl SandboxScene {
             show_collision: false,
             show_entities: true,
             show_point_lights: true,
+            player_model: None,
+            mob_model: None,
+            player_yaw: 0.0,
+            mob_yaw: 0.0,
             baked_gain: 1.0,
             lights,
             player,
@@ -432,6 +474,9 @@ impl SandboxScene {
     }
 
     fn move_player(&mut self, movement: Vec3) {
+        if movement.length_squared() > 0.0 {
+            self.player_yaw = movement.x.atan2(movement.z) + ACTOR_YAW_OFFSET;
+        }
         let desired = self.player + movement;
         let along_x = Vec3::new(desired.x, 0.0, self.player.z);
         if self.can_stand(along_x, 0.20) {
@@ -449,6 +494,10 @@ impl SandboxScene {
             let desired = self.mob + DIRECTIONS[self.mob_direction] * 1.35 * delta;
             if self.can_stand(desired, 0.24) {
                 self.mob = desired;
+                self.mob_yaw = DIRECTIONS[self.mob_direction]
+                    .x
+                    .atan2(DIRECTIONS[self.mob_direction].z)
+                    + ACTOR_YAW_OFFSET;
                 return;
             }
             self.mob_direction = (self.mob_direction + 1) % DIRECTIONS.len();
@@ -497,13 +546,43 @@ impl SandboxScene {
             } else {
                 0.0
             };
-            add_humanoid(&mut vertices, self.player + Vec3::Y * bob);
-            add_mob(
-                &mut vertices,
-                self.mob + Vec3::Y * ((self.elapsed * 4.0).sin() * 0.06),
-            );
+            if self.player_model.is_none() {
+                add_humanoid(&mut vertices, self.player + Vec3::Y * bob);
+            }
+            if self.mob_model.is_none() {
+                add_mob(
+                    &mut vertices,
+                    self.mob + Vec3::Y * ((self.elapsed * 4.0).sin() * 0.06),
+                );
+            }
         }
         vertices
+    }
+
+    /// The actor's triangles placed in the world: rotated to its heading, moved to its position.
+    fn actor_vertices(&self, kind: ActorKind) -> Vec<Vertex> {
+        if !self.show_entities {
+            return Vec::new();
+        }
+        let (model, position, yaw) = match kind {
+            ActorKind::Player => (&self.player_model, self.player, self.player_yaw),
+            ActorKind::Mob => (&self.mob_model, self.mob, self.mob_yaw),
+        };
+        let Some(model) = model else {
+            return Vec::new();
+        };
+        let rotation = glam::Quat::from_rotation_y(yaw);
+        model
+            .vertices
+            .iter()
+            .map(|vertex| {
+                let mut placed = *vertex;
+                placed.position =
+                    (rotation * Vec3::from_array(vertex.position) + position).to_array();
+                placed.normal = (rotation * Vec3::from_array(vertex.normal)).to_array();
+                placed
+            })
+            .collect()
     }
 
     fn maximum_vertex_count(&self) -> usize {
@@ -1113,6 +1192,7 @@ struct Renderer {
     size: PhysicalSize<u32>,
     pipeline: wgpu::RenderPipeline,
     texture_bind_group: wgpu::BindGroup,
+    actors: Vec<ActorGpu>,
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: usize,
     vertex_count: u32,
@@ -1276,6 +1356,28 @@ impl Renderer {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
         let depth = DepthTarget::new(&device, width, height);
+        let mut actors = Vec::new();
+        for (kind, model) in [
+            (ActorKind::Player, &scene.player_model),
+            (ActorKind::Mob, &scene.mob_model),
+        ] {
+            let Some(model) = model else {
+                continue;
+            };
+            let (_layout, bind_group) = model.textures.upload(&device, &queue);
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("sandbox actor vertices"),
+                size: (model.vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            actors.push(ActorGpu {
+                kind,
+                bind_group,
+                buffer,
+                count: 0,
+            });
+        }
         eprintln!("uploaded {} triangles", vertices.len() / 3);
         Ok(Self {
             surface,
@@ -1285,6 +1387,7 @@ impl Renderer {
             size,
             pipeline,
             texture_bind_group,
+            actors,
             vertex_buffer,
             vertex_capacity,
             vertex_count: vertices.len() as u32,
@@ -1336,6 +1439,12 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
             self.vertex_count = vertices.len() as u32;
+        }
+        for actor in &mut self.actors {
+            let placed = self.scene.actor_vertices(actor.kind);
+            actor.count = placed.len() as u32;
+            self.queue
+                .write_buffer(&actor.buffer, 0, bytemuck::cast_slice(&placed));
         }
         if self.config.height != 0 {
             let mut uniform = self
@@ -1414,6 +1523,11 @@ impl Renderer {
             pass.set_bind_group(1, &self.texture_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             pass.draw(0..self.vertex_count, 0..1);
+            for actor in self.actors.iter().filter(|actor| actor.count > 0) {
+                pass.set_bind_group(1, &actor.bind_group, &[]);
+                pass.set_vertex_buffer(0, actor.buffer.slice(..));
+                pass.draw(0..actor.count, 0..1);
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
@@ -1450,6 +1564,114 @@ impl DepthTarget {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActorKind {
+    Player,
+    Mob,
+}
+
+/// A textured `.MOD` in its bind pose, in sandbox units with the origin at its feet.
+///
+/// Skinning is not applied (the weights are not decoded yet), so it stands still: the raw
+/// vertex positions of these models already are the bind pose.
+struct ActorModel {
+    vertices: Vec<Vertex>,
+    textures: MapTextures,
+}
+
+impl ActorModel {
+    fn load(ttb_path: &Path, package: &str, entry: &str, tile_size: f32) -> Result<Self, String> {
+        let archive = open_data_package(ttb_path, package)?;
+        let bytes = archive
+            .read_entry(entry)
+            .map_err(|error| error.to_string())?;
+        let model = ModelFile::parse(&bytes).map_err(|error| error.to_string())?;
+        // The textures of a model live in its own package (`.dds`, sometimes `.tif`).
+        let packages = TexturePackages {
+            dds: Some(archive.clone()),
+            tif: Some(archive),
+        };
+        let names: Vec<String> = model
+            .materials
+            .iter()
+            .map(|material| material.texture_name.clone())
+            .collect();
+        let textures = MapTextures::from_names(&names, &packages);
+
+        let scale = 1.0 / tile_size;
+        let mut vertices = Vec::new();
+        for mesh in &model.meshes {
+            let Some(geometry) = &mesh.geometry else {
+                continue;
+            };
+            let points: Vec<Vec3> = geometry
+                .positions
+                .iter()
+                .map(|position| Vec3::from_array(*position) * scale)
+                .collect();
+            // Smooth normals: area-weighted average of the faces around each vertex.
+            let mut normals = vec![Vec3::ZERO; points.len()];
+            for face in geometry.face_groups.iter().flat_map(|group| &group.faces) {
+                let [a, b, c] = face.map(usize::from);
+                if a.max(b).max(c) >= points.len() {
+                    continue;
+                }
+                let normal = (points[b] - points[a]).cross(points[c] - points[a]);
+                normals[a] += normal;
+                normals[b] += normal;
+                normals[c] += normal;
+            }
+            for group in &geometry.face_groups {
+                let layer = textures.layer_for_material(group.material_index);
+                let color = match (layer, model.materials.get(group.material_index as usize)) {
+                    (Some(_), _) => [1.0; 3],
+                    (None, Some(material)) => {
+                        material_color(&material.texture_name, group.material_index)
+                    }
+                    (None, None) => material_color("missing", group.material_index),
+                };
+                let layer = layer.map_or(-1.0, |layer| layer as f32);
+                for face in &group.faces {
+                    let corners = face.map(usize::from);
+                    if corners.iter().any(|index| *index >= points.len()) {
+                        continue;
+                    }
+                    for corner in corners {
+                        let uv = geometry
+                            .texture_coordinates
+                            .get(corner)
+                            .copied()
+                            .unwrap_or([0.0, 0.0]);
+                        vertices.push(Vertex::textured(
+                            points[corner],
+                            normals[corner].normalize_or(Vec3::Y),
+                            color,
+                            uv,
+                            layer,
+                        ));
+                    }
+                }
+            }
+        }
+        if vertices.is_empty() {
+            return Err("the model has no decodable mesh".to_owned());
+        }
+        eprintln!(
+            "loaded actor {package}/{entry}: {} triangles",
+            vertices.len() / 3
+        );
+        Ok(Self { vertices, textures })
+    }
+}
+
+/// GPU side of an [`ActorModel`]: its own texture array and a vertex buffer rewritten each frame.
+struct ActorGpu {
+    kind: ActorKind,
+    bind_group: wgpu::BindGroup,
+    buffer: wgpu::Buffer,
+    count: u32,
+}
+
 /// The texture packages a map can draw from.
 struct TexturePackages {
     dds: Option<PakArchive>,
@@ -1482,15 +1704,26 @@ impl MapTextures {
                 .ok(),
         };
 
+        let names: Vec<String> = model
+            .materials
+            .iter()
+            .map(|material| material.texture_name.clone())
+            .collect();
+        Self::from_names(&names, &packages)
+    }
+
+    /// One layer per unique texture name (case-insensitive); materials without a texture
+    /// keep `None` and use a flat colour.
+    fn from_names(names: &[String], packages: &TexturePackages) -> Self {
         let mut textures = Self::default();
         let mut layer_by_name: Vec<(String, Option<u32>)> = Vec::new();
-        for material in &model.materials {
-            let key = material.texture_name.to_ascii_lowercase();
-            if let Some((_, layer)) = layer_by_name.iter().find(|(name, _)| *name == key) {
+        for name in names {
+            let key = name.to_ascii_lowercase();
+            if let Some((_, layer)) = layer_by_name.iter().find(|(known, _)| *known == key) {
                 textures.material_layers.push(*layer);
                 continue;
             }
-            let layer = textures.decode(&packages, &material.texture_name);
+            let layer = textures.decode(packages, name);
             layer_by_name.push((key, layer));
             textures.material_layers.push(layer);
         }
@@ -1503,7 +1736,7 @@ impl MapTextures {
         eprintln!(
             "loaded {} unique textures for {} materials",
             textures.images.len(),
-            model.materials.len()
+            names.len()
         );
         textures
     }

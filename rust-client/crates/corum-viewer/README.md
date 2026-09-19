@@ -107,6 +107,27 @@ Texturas e iluminação são procuradas, nesta ordem: na pasta de dados do jogo 
 
 Verificados na tela: `1100` (masmorra escura com poças de luz coloridas), `5` (vila, com sombras assadas no chão), `101` (masmorra com 141 luzes) e `750` (templo flutuante). Nos três últimos todos os materiais receberam textura.
 
+### Personagem e mob reais
+
+O personagem controlável e o mob em patrulha são modelos `.MOD` reais e texturizados, na
+**pose de bind** (as posições cruas desses modelos já são a pose de bind; o skinning ainda não é
+aplicado, então eles não animam). Cada modelo pega as texturas do seu próprio pacote
+(`.dds`, às vezes `.tif`), tem normais suaves, recebe o ambiente e as luzes pontuais do mapa e
+gira para a direção em que anda. Padrões: `Npc/npc007.mod` (humano) e `Monster/m00010.mod`
+(diabrete alado). Para trocar, use `Pacote/arquivo.mod` (pacotes `Npc`, `Monster`, `Character`,
+`Map_chr`) ou `none` para voltar às caixas:
+
+```powershell
+$env:CORUM_PLAYER = 'Npc/npc012.mod'
+$env:CORUM_MOB = 'Monster/m00760.mod'
+cargo run -p corum-viewer --bin corum-sandbox
+```
+
+`H` mostra ou oculta os dois. As unidades são as do mapa (1 tile = 125 unidades; o NPC tem 175, ou
+1,4 tile), e a frente dos modelos é `+Z` (`ACTOR_YAW_OFFSET` no código corrige um modelo que
+olhe para o lado errado). Verificados na tela: `npc007`, `npc012`, `m00010` e `m00760`;
+`Character/bw0001_000.mod` e `Monster/m00150.mod` carregam sem erro.
+
 ### Iluminação
 
 - **Cor por vértice (`.vcl`)**: os objetos tipo 1 recebem `textura × cor do VCL`, sem luz adicional, porque a cor já contém a iluminação pré-calculada. É o que dá às muralhas e rochas a variação de tom (verde, rosado, alaranjado). No `1100`, as 22.157 cores casam com os 22.157 vértices; se a contagem não bater, o arquivo é ignorado com um aviso.

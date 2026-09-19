@@ -99,8 +99,10 @@ Antes eram 53, 338, 22 e 0. Confirmado na tela: um monstro alado (`Monster_m0063
 **Ainda não decodificado:**
 
 - ~80 malhas de `Character`, ~50 de `Map_chr` e ~17 de `Monster` (erros do tipo "campo truncado" ou "contagem irracional" no meio do payload; layout de grupo ou vértices diferente, a investigar com `tools/survey_models.py`);
-- o restante do payload de cada malha: 3 registros por grupo (12 valores + 7 inteiros), um bloco de floats de tamanho `faces × 12` (provável normais por face) e outro de `V × 12` (provável normais por vértice) **[hipótese]**;
-- pesos de skinning e a ligação de cada malha a um osso: os modelos são desenhados hoje **sem pose**, cada malha em suas coordenadas locais. Personagens com várias peças (ex.: `Character_pm1277_000`) saem como peças sobrepostas até os nós `F5` (ossos) e o `pivot`/`parent_index` de cada malha serem aplicados.
+- o restante do payload de cada malha (a "cauda", depois dos grupos). Medido em ~2.000 malhas com o parser atual:
+  - malhas mais simples (sem dados de skinning): `12 bytes + V × 12` (três palavras zero e depois `V` vetores unitários, provavelmente normais por vértice **[hipótese]**); é o que 547 das 1.621 malhas medidas têm (incluindo peças de modelos com ossos);
+  - malhas **com esqueleto** têm mais dados, de tamanho variável, e não seguem nenhuma fórmula linear em `V`, `F`, `G` ou `T` (ajuste por mínimos quadrados com erro máximo de ~30 KB). Nas menores (`V = 4`) a cauda é um cabeçalho de 8 palavras `V, T, T, 1, 0x10100, ?, ?, nº de ossos usados`, depois **um registro de 8 palavras por vértice** `osso (u32), peso (1.0), posição local ao osso (3 × f32), normal local (3 × f32)`, e no fim as `V × 12` normais **[hipótese, lida a olho em uma malha de 4 vértices]**. Malhas grandes (a lula `Character_pm1277`, 1.216 vértices, 27 ossos) têm uma tabela com passo regular (`3, 7, 11, 15…` e `1025, 2049, 3073…`) que ainda não foi decifrada;
+- pesos de skinning e a ligação de cada malha a um osso. **Correção:** as posições cruas dos modelos já são a **pose de bind** (um NPC humano, um monstro alado, um diabrete e um espectro saem inteiros sem aplicar nenhum osso), então não é preciso hierarquia de nós para *mostrar* o modelo parado. A hierarquia (`F5`, `pivot`, `parent_index`) e o skinning só entram para **animar**. A aparência "embaralhada" de `Character_pm1277_000` era uma lula de tentáculos abertos, não um erro.
 
 ### ANM versão 1
 

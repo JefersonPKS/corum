@@ -48,6 +48,7 @@ fn run() -> Result<(), String> {
         "pose-check" if arguments.len() == 3 => pose_check(&arguments[1], &arguments[2]),
         "lm-info" if arguments.len() == 3 => lm_info(&arguments[1], &arguments[2]),
         "cdb-info" if arguments.len() == 2 => cdb_info(&arguments[1]),
+        "erd-dump" if arguments.len() == 2 => erd_dump(&arguments[1]),
         "cdb-decode-all" if arguments.len() == 3 => cdb_decode_all(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
@@ -150,6 +151,15 @@ fn cdb_rows<T: Record>(decoded: &[u8], show: impl Fn(&T) -> String) -> Result<()
     println!("kind: {} records of {} bytes", rows.len(), T::SIZE);
     for row in rows.iter().take(10) {
         println!("  {}", show(row));
+    }
+    Ok(())
+}
+
+fn erd_dump(path: &str) -> Result<(), String> {
+    let entries = corum_assets::erd::parse(&fs::read(path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    for entry in &entries {
+        println!("0x{:08X}	{}", entry.id, entry.path);
     }
     Ok(())
 }
@@ -602,6 +612,7 @@ fn usage() -> String {
         "  corum-assets anm-info <motion.anm>",
         "  corum-assets ttb-info <map.ttb>",
         "  corum-assets cdb-info <table.cdb>",
+        "  corum-assets erd-dump <resource.erd>",
         "  corum-assets cdb-decode-all <Data/Manager> <output-dir>",
         "  corum-assets map-info <scene.map>",
         "  corum-assets stm-info <scene.stm>",

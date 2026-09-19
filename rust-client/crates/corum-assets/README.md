@@ -347,6 +347,30 @@ Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo ca
 - **Ainda sem parser tipado** (a struct está no servidor ou não foi localizada): `ItemWeapon`, `ItemArmor`, `ItemConsumable`, `ItemSpecial`, `ItemSupplies`, `ItemMaterials`, `ItemEdition`, `Itemtalisman`, `ItemGuardian`, `ItemSetInfo`, `ItemAttrDefine`, `ItemUpgrade` (o cliente os recebe do servidor/`CBaseItem`), `Skill`/`SkillEffect` (`Skill.cdb` = `SkillEffect.cdb`, 202.176 B; começa com `u16 id`, `u16`…, nome de 32 B), `questlist` (226.502 B), `questnpc` (3.006 B), `questtitle` (2.052 B), `Interface*Info`, `KeyInfo`, `Hairshopoption`, `EventDungeonDescription`, `GroupInfo`, `Level`-like menores. Os cabeçalhos das tabelas de item começam com `u16 id` + nome (`Short Sword`, `Cap`, `Experience x2 (under lev 70)`).
 - **CLI:** `cdb-info <arquivo.cdb>` mostra o tipo/contagem e os 10 primeiros registros; `cdb-decode-all <Data\Manager> <saida>` grava os 55 corpos decifrados como `.bin`, para inspecionar as tabelas ainda sem parser.
 
+## Tabelas de recursos `.erd` (módulo `erd`, 2026-09-19)
+
+`CorumResource.erd` e `DefResource.erd` (raiz do cliente) ligam **id de recurso → caminho de arquivo**, como os comentários de `CorumOnlineProject/DefResource.h` sugerem (`167782161 // .\Data\Map\worldmap1.cdb`).
+
+- **Layout [confirmado]:** `u32 contagem`, `contagem × (u32 id, u32 tamanho)`, depois os caminhos concatenados (sem terminador). O total fecha exatamente com o arquivo: 1.140 entradas (33.669 B) e 181 entradas (5.939 B).
+- **Categoria = byte alto do id [hipótese]:** em `CorumResource.erd`, `0x0A` = UI (709 entradas, `.\Data\UI\*.tga/.tif`), `0x0D` = 176, `0x0C` = 32, `0x0B`/`0x0E`/`0x0F` poucos, `0x64`–`0x6A` = efeitos (`.\Data\Effect\*.chr`), `0x73`, `0xBA`, `0x2F`. Em `DefResource.erd`: `0x01`/`0x02` = modelos de personagem (`ph101001.MOD`…), `0x0A` = mapas (`.map`), `0x0C` = NPC (`NPC4.cdb`…).
+- **Cobertura:** 1.103 dos 1.140 caminhos de `CorumResource.erd` existem no cliente instalado (o resto são placeholders `.` e alguns efeitos/águas ausentes). `DefResource.erd` é de 2004 e cita 85 arquivos que este cliente de 2007 não traz (mapas antigos): usar só como pista.
+- **CLI:** `corum-assets erd-dump <arquivo.erd>` imprime `0xID<TAB>caminho`.
+
+## Exportação completa para montar o cliente
+
+`tools/export_client_data.py <cliente> <saida>` reúne tudo numa pasta (12.667 arquivos, 1,28 GB em 54 s, **fora do git**: `rust-client/export/` está no `.gitignore`):
+
+| Pasta | Conteúdo |
+|---|---|
+| `paks/<Pacote>/` | conteúdo dos 13 `.pak` (`.dds` 3.441, `.mod` 2.158, `.anm` 1.819, `.chr` 1.498, `.tif` 683, `.tga` 342, `.vcl` 206, `.lm` 204…) |
+| `loose/` | soltos de `Data`: `Map` (202 `.ttb`, 5 `.map`…), `Cdt` (219), `Sound` (1.054 `.wav`, 31 `.mp3`), `Cursor`, `Manager` |
+| `manager_decoded/` | os 55 `.cdb` decifrados (`.bin`) |
+| `resources/` | os dois `.erd` como `0xID<TAB>caminho` |
+| `config/` | `.erd`, `.ini`, `Paklist.sin` |
+| `manifest.json` | por arquivo: tamanho e sha256; contagem por extensão e por pasta |
+
+Não entram: executáveis/DLLs do cliente e a pasta de patch. Rodar de novo sobrescreve; comparar o `manifest.json` de duas execuções mostra o que mudou entre versões do cliente.
+
 ## Uso
 
 ```powershell
@@ -371,6 +395,10 @@ cargo run -p corum-assets -- lm-info  "D:\Games\CorumOnline\Data\Map\1100.lm"  "
 # tabelas de jogo (Manager)
 cargo run -p corum-assets -- cdb-info "D:\Games\CorumOnline\Data\Manager\npctable.cdb"
 cargo run -p corum-assets -- cdb-decode-all "D:\Games\CorumOnline\Data\Manager" .\target\verification\cdb
+cargo run -p corum-assets -- erd-dump "D:\Games\CorumOnline\CorumResource.erd"
+
+# exporta tudo para uma pasta só (paks + soltos + cdb decifrados + erd + manifesto; fora do git)
+python tools/export_client_data.py "D:\Games\CorumOnline" export
 ```
 
 Para conferir todos os mapas de uma vez (extrai os arquivos dos pacotes e roda `stm-info`, `vcl-info`, `lm-info` e `map-info` em cada um):

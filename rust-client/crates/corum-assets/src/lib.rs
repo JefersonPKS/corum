@@ -3,6 +3,7 @@
 pub mod cdb;
 pub mod chr;
 pub mod dds;
+pub mod erd;
 pub mod lightmap;
 pub mod map_script;
 pub mod model;

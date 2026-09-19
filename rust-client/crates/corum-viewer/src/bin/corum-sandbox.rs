@@ -59,6 +59,17 @@ const TRANSLUCENT_PARTIAL_FRACTION: f32 = 0.6;
 const BLACK_KEYED_FRACTION: f32 = 0.7;
 /// Rotation (radians) added to the movement heading so a model's front faces where it walks.
 const ACTOR_YAW_OFFSET: f32 = 0.0;
+
+/// The turn that points a model's front along its movement. The sandbox turns an actor by the
+/// heading `atan2(x, z)`, which assumes the model looks toward +Z; the player models of the
+/// `Character` package look the other way (they walked backwards without this).
+fn facing_offset(package: &str) -> f32 {
+    if package.eq_ignore_ascii_case("character") {
+        std::f32::consts::PI
+    } else {
+        0.0
+    }
+}
 /// Pixels the cursor may move between press and release for the click to still be a move order
 /// (a longer drag orbits the camera instead).
 const CLICK_DRAG_LIMIT: f32 = 5.0;
@@ -887,7 +898,14 @@ impl SandboxScene {
         let Some(model) = model else {
             return Vec::new();
         };
-        let rotation = glam::Quat::from_rotation_y(yaw);
+        // Head, helmet, weapon and shield turn with the body they are attached to.
+        let facing = match kind {
+            ActorKind::Mob => model.facing,
+            ActorKind::Player | ActorKind::Attached(_) => {
+                self.player_model.as_ref().map_or(0.0, |body| body.facing)
+            }
+        };
+        let rotation = glam::Quat::from_rotation_y(yaw + facing);
         model
             .vertices
             .iter()
@@ -2072,6 +2090,8 @@ enum ActorKind {
 /// bind pose (the raw vertex positions already are the bind pose); actors loaded with a rig are
 /// re-posed every frame from a `.ANM`.
 struct ActorModel {
+    /// Turn (radians) that makes the model's own front line up with the direction it moves in.
+    facing: f32,
     vertices: Vec<Vertex>,
     textures: MapTextures,
     rig: Option<Rig>,
@@ -2138,6 +2158,7 @@ impl ActorModel {
             tif: vec![archive],
         };
         let mut model = Self::from_bytes(&bytes, &packages, tile_size, true)?;
+        model.facing = facing_offset(package);
         let (idle, moving) = motion_slots_override(package, anim_variable);
         model.attach_motions(&packages.dds[0], entry, idle, moving);
         eprintln!(
@@ -2388,6 +2409,7 @@ impl ActorModel {
             clock: 0.0,
         });
         Ok(Self {
+            facing: 0.0,
             vertices,
             textures,
             rig,
@@ -2764,6 +2786,7 @@ fn load_props(ttb_path: &Path, map: &TileMap) -> Vec<PropBatch> {
         let animated = model.rig.is_some().then(|| AnimatedProp {
             instances: instances.iter().map(|object| (*object).clone()).collect(),
             model: ActorModel {
+                facing: 0.0,
                 vertices: model.vertices.clone(),
                 textures: MapTextures::default(),
                 rig: model.rig.take(),
@@ -3389,6 +3412,15 @@ mod tests {
         }
         // A ray that looks at the sky never meets the ground.
         assert!(unproject_to_ground(view_projection, Vec2::new(0.0, 1.0), 40.0).is_none());
+    }
+
+    #[test]
+    fn character_models_are_turned_to_face_their_movement() {
+        // Sem esse giro os personagens andavam de costas (o "moonwalk").
+        assert!((facing_offset("Character") - std::f32::consts::PI).abs() < 1e-6);
+        assert!((facing_offset("character") - std::f32::consts::PI).abs() < 1e-6);
+        assert_eq!(facing_offset("Monster"), 0.0);
+        assert_eq!(facing_offset("Npc"), 0.0);
     }
 
     #[test]

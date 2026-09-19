@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use audio::{Audio, Cue, music_for_map};
 use bytemuck::{Pod, Zeroable};
 use combat::{
     HURT_SECONDS, MOB_ATTACK_COOLDOWN, MOB_CHASE_SPEED, MOB_DAMAGE, MOB_MAX_HP, MOB_REACH,
@@ -40,6 +41,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+#[path = "../audio.rs"]
+mod audio;
 #[path = "../combat.rs"]
 mod combat;
 #[path = "../ui_gpu.rs"]
@@ -175,6 +178,7 @@ fn run() -> Result<(), String> {
     // `CORUM_PLAYER` names the body model directly; otherwise an outfit (`CORUM_CLASS`,
     // `CORUM_ARMOR`, ...) builds the character, and with neither the default NPC stands in.
     let mut weapon_type = 0;
+    let mut class = 1;
     let mut player_cdt = None;
     match Outfit::from_env().filter(|_| env::var_os("CORUM_PLAYER").is_none()) {
         Some(outfit) => {
@@ -182,6 +186,7 @@ fn run() -> Result<(), String> {
             scene.player_model = body;
             scene.attachments = parts;
             weapon_type = item_type(outfit.right);
+            class = outfit.class;
             player_cdt = load_cdt(&path, &format!("pm{:02}000", outfit.class));
         }
         None => {
@@ -198,7 +203,8 @@ fn run() -> Result<(), String> {
         .unwrap_or_default()
         .to_owned();
     let mob_cdt = load_cdt(&path, &mob_stem);
-    scene.setup_combat(weapon_type, player_cdt.as_ref(), mob_cdt.as_ref());
+    scene.setup_combat(class, weapon_type, player_cdt.as_ref(), mob_cdt.as_ref());
+    scene.audio = load_audio(&path);
     scene.pending_ui = load_interface(&path);
     // Debug: `CORUM_AUTOFIGHT=1` orders the attack on the monster right away (repeatable checks).
     if env::var_os("CORUM_AUTOFIGHT").is_some() {
@@ -225,6 +231,29 @@ fn run() -> Result<(), String> {
     event_loop
         .run_app(&mut application)
         .map_err(|error| error.to_string())
+}
+
+/// Sound and music from `Data\\Sound`. `CORUM_SOUND=off` silences the effects and `CORUM_MUSIC=off`
+/// the music; without an audio device the game is simply silent.
+fn load_audio(ttb_path: &Path) -> Option<Audio> {
+    let off = |name: &str| env::var(name).is_ok_and(|value| value.eq_ignore_ascii_case("off"));
+    if off("CORUM_SOUND") && off("CORUM_MUSIC") {
+        return None;
+    }
+    let directory = data_directories(ttb_path)
+        .into_iter()
+        .map(|directory| directory.join("Sound"))
+        .find(|directory| directory.is_dir())?;
+    let mut audio = Audio::new(directory, !off("CORUM_SOUND"))?;
+    if !off("CORUM_MUSIC") {
+        let map: u32 = ttb_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.parse().ok())
+            .unwrap_or(0);
+        audio.play_music(music_for_map(map), 0.35);
+    }
+    Some(audio)
 }
 
 /// `Data\\Cdt\\<stem>.cdt`: the key frames of each motion of a character or monster.
@@ -432,7 +461,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         if game_mode() {
-            return "Corum Online (Rust) — clique: andar ou atacar o monstro | T: inventário | A: personagem | S: habilidades | O: opções | Esc: fechar janela ou sair".to_owned();
+            return "Corum Online (Rust) — clique: andar ou atacar o monstro | M: música | T: inventário | A: personagem | S: habilidades | O: opções | Esc: fechar janela ou sair".to_owned();
         }
         format!(
             "Corum Map Viewer — {} — {} — clique: andar | Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
@@ -507,10 +536,15 @@ impl ApplicationHandler for SandboxApplication {
                     .last_cursor
                     .map_or((0.0, 0.0), |cursor| (cursor.x, cursor.y));
                 if pressed {
-                    renderer.ui_captured = renderer.ui.as_mut().is_some_and(|ui| {
-                        let point = ui_gpu::to_screen(window_size, cursor);
-                        ui.desktop.press(point) != corum_assets::ui::Press::World
-                    });
+                    let result = renderer
+                        .ui
+                        .as_mut()
+                        .map(|ui| ui.desktop.press(ui_gpu::to_screen(window_size, cursor)));
+                    renderer.ui_captured =
+                        result.is_some_and(|result| result != corum_assets::ui::Press::World);
+                    if matches!(result, Some(corum_assets::ui::Press::Closed(_))) {
+                        renderer.scene.cues.push(Cue::WindowClose);
+                    }
                     renderer.camera.drag_distance = 0.0;
                 } else if let Some(ui) = &mut renderer.ui {
                     ui.desktop.release();
@@ -544,7 +578,9 @@ impl ApplicationHandler for SandboxApplication {
                             .ui
                             .as_mut()
                             .is_some_and(|ui| ui.desktop.close_top());
-                        if !closed {
+                        if closed {
+                            renderer.scene.cues.push(Cue::WindowClose);
+                        } else {
                             event_loop.exit();
                         }
                     } else if let Some(name) = hotkey
@@ -553,7 +589,18 @@ impl ApplicationHandler for SandboxApplication {
                         if let Some(ui) = &mut renderer.ui
                             && let Some(id) = ui.desktop.catalog().window_named(name)
                         {
+                            let was_open = ui.desktop.is_open(id);
                             ui.desktop.toggle(id);
+                            renderer.scene.cues.push(if was_open {
+                                Cue::WindowClose
+                            } else {
+                                Cue::WindowOpen
+                            });
+                        }
+                    } else if pressed && code == KeyCode::KeyM && renderer.game_mode {
+                        if let Some(audio) = &mut renderer.scene.audio {
+                            let playing = audio.toggle_music();
+                            eprintln!("audio: music {}", if playing { "on" } else { "off" });
                         }
                     } else if renderer.game_mode
                         && matches!(
@@ -693,6 +740,12 @@ struct SandboxScene {
     fight: Fight,
     mob_moving: bool,
     camera_yaw: f32,
+    /// Sounds requested during the frame, played at its end.
+    cues: Vec<Cue>,
+    audio: Option<Audio>,
+    player_class: u16,
+    /// `.cdt` key frames of the walking motion (where the feet touch the ground).
+    walk_keys: Vec<u32>,
     /// The original interface (windows and their images), handed to the renderer once.
     pending_ui: Option<(UiDesktop, Option<PakArchive>)>,
 }
@@ -761,6 +814,10 @@ impl SandboxScene {
             fight: Fight::new(player, mob),
             mob_moving: false,
             camera_yaw: 0.0,
+            cues: Vec::new(),
+            audio: None,
+            player_class: 1,
+            walk_keys: Vec::new(),
             pending_ui: None,
         })
     }
@@ -830,6 +887,42 @@ impl SandboxScene {
         let mob_moving = self.mob_moving;
         if let Some(model) = &mut self.mob_model {
             model.animate(delta, mob_moving);
+        }
+        self.footsteps();
+        self.play_cues();
+    }
+
+    /// A step sound each time the walking motion reaches one of its `.cdt` key frames.
+    fn footsteps(&mut self) {
+        if !self.moving || self.fight.player_state != PlayerState::Free || self.walk_keys.is_empty()
+        {
+            return;
+        }
+        let walk = player_slot(self.fight.item_type, player_motion::WALK);
+        let Some(model) = &self.player_model else {
+            return;
+        };
+        if model.shown_slot() == Some(walk)
+            && self.walk_keys.iter().any(|key| model.passed_frame(*key))
+        {
+            self.cues.push(Cue::Footstep {
+                run: self.input.run,
+            });
+        }
+    }
+
+    fn play_cues(&mut self) {
+        let cues = std::mem::take(&mut self.cues);
+        // Debug: `CORUM_SOUND_LOG=1` prints every sound the game asks for.
+        if env::var_os("CORUM_SOUND_LOG").is_some() {
+            for cue in &cues {
+                eprintln!("sound: {cue:?}");
+            }
+        }
+        if let Some(audio) = &mut self.audio {
+            for cue in cues {
+                audio.play(cue);
+            }
         }
     }
 
@@ -910,6 +1003,12 @@ impl SandboxScene {
         if let Some(model) = &mut self.player_model {
             model.play_action(slot, false);
         }
+        self.cues.push(Cue::Swing {
+            armed: self.fight.item_type > 0,
+        });
+        self.cues.push(Cue::AttackVoice {
+            class: self.player_class,
+        });
     }
 
     /// The blow lands (at the `.cdt` key frame of the swing): hurt the monster if it is in reach.
@@ -921,6 +1020,7 @@ impl SandboxScene {
         let damage = player_damage_roll(self.fight.blows);
         self.fight.blows += 1;
         let killed = self.fight.mob_life.hurt(damage);
+        self.cues.push(Cue::WeaponHit);
         eprintln!(
             "combat: you hit the monster for {damage} ({}/{})",
             self.fight.mob_life.hp, self.fight.mob_life.max
@@ -956,6 +1056,12 @@ impl SandboxScene {
             self.fight.player_life.hp, self.fight.player_life.max
         );
         let item_type = self.fight.item_type;
+        let class = self.player_class;
+        self.cues.push(if killed {
+            Cue::Death { class }
+        } else {
+            Cue::Hurt { class }
+        });
         if killed {
             self.fight.player_state = PlayerState::Dead;
             self.fight.player_clock = 0.0;
@@ -1107,8 +1213,25 @@ impl SandboxScene {
 
     /// Wires the motions of the equipped weapon and the swing timings, from the `.chr` slots and the
     /// `.cdt` key frames; without them a swing lands halfway through.
-    fn setup_combat(&mut self, item_type: u16, player_cdt: Option<&Cdt>, mob_cdt: Option<&Cdt>) {
+    fn setup_combat(
+        &mut self,
+        class: u16,
+        item_type: u16,
+        player_cdt: Option<&Cdt>,
+        mob_cdt: Option<&Cdt>,
+    ) {
+        self.player_class = class;
         self.fight.item_type = item_type;
+        self.walk_keys = player_cdt
+            .and_then(|cdt| cdt.effect_frames(u32::from(item_type), u32::from(player_motion::WALK)))
+            .map(|frames| {
+                frames[..2]
+                    .iter()
+                    .map(|frame| u32::from(*frame))
+                    .filter(|frame| *frame > 0)
+                    .collect()
+            })
+            .unwrap_or_default();
         if let Some(model) = &mut self.player_model {
             model.set_stance(
                 player_slot(item_type, player_motion::STAND1),
@@ -2648,6 +2771,10 @@ struct Rig {
     /// A motion played once (an attack, a hit, falling down) that overrides idle and walking.
     action: Option<Action>,
     action_restart: bool,
+    /// Slot and frame numbers of the last two poses, to notice when a key frame goes by.
+    frame_slot: Option<usize>,
+    frame: f32,
+    previous_frame: f32,
 }
 
 struct Action {
@@ -2765,6 +2892,25 @@ impl ActorModel {
         true
     }
 
+    /// The slot whose pose was shown last.
+    fn shown_slot(&self) -> Option<usize> {
+        self.rig.as_ref()?.frame_slot
+    }
+
+    /// Did the last step of the motion pass the frame number `key` (a `.cdt` key frame)? A looping
+    /// motion that wrapped around counts the frames after its start too.
+    fn passed_frame(&self, key: u32) -> bool {
+        let Some(rig) = &self.rig else {
+            return false;
+        };
+        let key = key as f32;
+        if rig.frame >= rig.previous_frame {
+            rig.previous_frame < key && key <= rig.frame
+        } else {
+            key > rig.previous_frame || key <= rig.frame
+        }
+    }
+
     fn stop_action(&mut self) {
         if let Some(rig) = &mut self.rig {
             rig.action = None;
@@ -2802,6 +2948,7 @@ impl ActorModel {
             rig.current = wanted;
             rig.clock = 0.0;
             rig.action_restart = false;
+            rig.frame_slot = None;
         }
         let Some(Some(motion)) = rig.current.and_then(|slot| rig.motions.get(slot)) else {
             return;
@@ -2821,6 +2968,13 @@ impl ActorModel {
         {
             rig.action = None;
         }
+        rig.previous_frame = if rig.frame_slot == rig.current {
+            rig.frame
+        } else {
+            frame
+        };
+        rig.frame = frame;
+        rig.frame_slot = rig.current;
         let tracks = rig.skeleton.tracks_for(motion);
         let pose = rig.skeleton.pose(&tracks, frame);
         rig.pose.clone_from(&pose);
@@ -3000,6 +3154,9 @@ impl ActorModel {
             clock: 0.0,
             action: None,
             action_restart: false,
+            frame_slot: None,
+            frame: 0.0,
+            previous_frame: 0.0,
         });
         Ok(Self {
             facing: 0.0,

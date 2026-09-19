@@ -27,6 +27,7 @@ interface original. Ainda **não** é o jogo completo (veja "O que ainda não ex
 | **S** | habilidades (`Skill`) |
 | **O** | opções (`Option`) |
 | `Esc` | fecha a janela da frente; sem nenhuma aberta, sai do jogo |
+| `M` | liga / desliga a música |
 | `R` | restaura a câmera |
 
 As letras seguem o `KeyConfig.ini` do cliente original. As janelas abrem nas posições originais (1024 × 768,
@@ -43,7 +44,7 @@ escaladas à janela), podem ser **arrastadas pela barra de título**, fechadas p
 - **Detalhes visuais conhecidos**: o elmo pode ficar escondido pelo cabelo; a empunhadura da arma não foi
   conferida com o original; algumas armas animadas (garras) aparecem incompletas; a janela de personagem mostra
   três botões soltos ("Cancel / Invitation / Close") que pertencem a outro diálogo.
-- Ainda não há som nem música. A câmera não tem colisão (uma pedra pode ficar na frente).
+- **Som:** há música do mapa, passos, golpes, vozes do personagem e sons das janelas (com as regras do jogo original). **Monstros não têm som**: os sons deles vêm do banco do servidor. Se não houver placa de som, o jogo fica mudo. A câmera não tem colisão (uma pedra pode ficar na frente).
 
 ## Para desenvolvedores
 

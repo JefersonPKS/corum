@@ -11,5 +11,6 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 corum-assets = { path = "../corum-assets" }
 glam = "0.33.0"
 pollster = "1.0.0"
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "wav", "mp3"] }
 wgpu = "30.0.0"
 winit = "0.30.0"

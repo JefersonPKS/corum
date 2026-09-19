@@ -216,6 +216,25 @@ Um combate de brinquedo para testar as animações originais. **Os números de v
 - **Depuração:** `CORUM_AUTOFIGHT=1` já manda atacar o monstro ao abrir (o log mostra `combat: ...` a cada golpe). O monstro agora nasce a ~7 tiles do jogador.
 - **Código:** regras puras e testadas em `src/combat.rs`; a máquina de estados (jogador livre/golpeando/ferido/caído, monstro em patrulha/perseguição/ataque/ferido/caído) e as ações de uma animação só (`play_action`, `set_stance`; `MotionFile::frame_clamped_at`) estão no sandbox.
 
+### Som e música (2026-09-19)
+
+Efeitos e música do mapa, com as **regras de escolha de arquivo do cliente original** (`DungeonProcess_Sound.cpp`, `Define.h`, `EffectInfo.h`); o áudio usa a biblioteca `rodio` (WASAPI no Windows; efeitos `wav` e música `mp3`). Sem dispositivo de áudio ou sem `Data\Sound`, o jogo segue mudo.
+
+| Som | Quando | Arquivo (`Data\Sound\<número>.wav`) |
+|---|---|---|
+| Passos | quando o movimento de andar passa pelos quadros-chave do `.cdt` (`bEffectFrame[0]` e `[1]`, quadros 5 e 16) | andar `2005`–`2008`; correr (Shift) `2001`–`2004` (`GAMEPLAY_HEABYSTONE_WALK` = 5, `_RUN` = 1, mais `GetRandom(4)`, mais 2000) |
+| "Vush" da arma | começo do golpe | `3111`–`3113` (arma) ou `3101`–`3103` (sem arma) |
+| Grito de ataque | começo do golpe | `3001 + (classe − 1) × 10 + {0..2}` |
+| Ferido / caindo | ao ser atingido / ao chegar a 0 de vida | `+3..5` / `+6..7` na mesma faixa da classe |
+| Impacto da arma | quando o golpe acerta | `3201`–`3202` |
+| Janelas | abrir / fechar | `4001` / `4002` (`SOUND_SYSTEM_WNDOPEN/CLOSE` + 4000) |
+| Música | ao abrir o mapa, em laço | pelo número do mapa (a "camada"): 604 → `Dungeon_Lair2`, 1100 → `Dungeon_Tower`, 5 → `Town_World1`, 750 → `Dungeon_Ameritart`, ≥ 10000 → `Map_World1`... |
+
+- **Arquivos de música com formato diferente [confirmado]:** cinco dos 31 `.mp3` (`Dungeon_Lair1`, `_Lair2`, `_Lair4`, `_Lair5`, `Dungeon_Tunnel1`) são um **WAV com formato `0x55`** (MP3 dentro de um contêiner RIFF), que o leitor de WAV não abre; `audio::mp3_stream` extrai o bloco `data`. Todos os 31 arquivos e todos os efeitos usados abrem no decodificador (teste com `CORUM_DATA`).
+- **Sons de monstro não tocam:** os números de som de cada monstro (`wNeu`, `wAttack`, `wDamage`, `wDeath`) vêm do banco do servidor (`BaseMonsterInfo`); offline não há como saber quais usar.
+- **Controles e depuração:** `M` liga/desliga a música; `CORUM_SOUND=off` e `CORUM_MUSIC=off` desligam os efeitos e a música; `CORUM_SOUND_LOG=1` imprime cada som pedido (`sound: Footstep { run: false }`).
+- **Hipóteses:** o número do `.ttb` é tomado como o número da camada para escolher a música; o "vush" usa o índice `1` para toda arma (é o que o código do cliente calcula para as armas comuns); volumes escolhidos a ouvido (efeitos 0,35–0,7, música 0,35).
+
 ### Verificação visual automatizada
 
 `tools/capture-window.ps1` abre um binário, mexe na câmera (roda, arrasto, teclas) e salva a janela em PNG. Se a janela não ficar ativa, o script não envia nenhuma entrada e não captura. Exemplo, depois de `cargo build -p corum-viewer`:

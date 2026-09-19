@@ -1,0 +1,6 @@
+{
+  "group": "corum-rust",
+  "repos": [
+    {"slug": "corum", "stack": "unknown"}
+  ]
+}

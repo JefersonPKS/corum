@@ -1,0 +1,8 @@
+[package]
+name = "corum-assets"
+version = "0.1.0"
+edition = "2024"
+description = "Safe inspector and extractor for Corum Online PAK archives"
+publish = false
+
+[dependencies]

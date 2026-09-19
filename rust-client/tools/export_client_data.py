@@ -80,6 +80,8 @@ def main() -> int:
     print("system (tabelas editáveis em TSV)")
     system = run(exe, "cdb-export-tsv", str(data / "Manager"), str(out / "system"))
     print("  " + system.strip().splitlines()[-1])
+    cdt = run(exe, "cdt-export-tsv", str(data / "Cdt"), str(out / "system" / "Cdt.tsv"))
+    print("  " + cdt.strip().splitlines()[-1])
 
     print("tabelas de recursos (.erd)")
     (out / "resources").mkdir(parents=True, exist_ok=True)

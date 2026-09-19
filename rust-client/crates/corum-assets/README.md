@@ -344,7 +344,7 @@ Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo ca
 | `message.cdb`, `Cmd_Message.cdb`, `Emoticon.cdb`, `Filter_*Conv_Message.cdb` | `TextPool` | — | 1.823 / 17 / 40 / 22 | assinatura `Oops`; `u32 (ignorado)`, `Oops`, `contagem`, `tamanho_dos_textos`, `contagem × (id, posição)`, textos NUL-terminados; o cliente indexa pela posição |
 
 - **Idioma [confirmado]:** este cliente traz os textos em **inglês** (`message.cdb`: "Bank", "Occupied Dungeon"…); nomes de NPC como "Takion". Campos fixos são bytes crus (`FixedText`), com decodificação GBK só quando aparecer texto não ASCII.
-- **Tabelas de item, habilidades e o resto** já têm esquema (ver a seção do "System" editável abaixo); ficam sem decifrar `questlist`, `questnpc`, `questtitle`, `Interface*Info`, `Hairshopoption`, `EventDungeonDescription` e os `.cdt`.
+- **Todas as tabelas com estrutura conhecida** já têm esquema (ver a seção do "System" editável abaixo); só fica sem decifrar o conteúdo de alguns campos `unknown_*`.
 - **CLI:** `cdb-info <arquivo.cdb>` mostra o tipo/contagem e os 10 primeiros registros; `cdb-decode-all <Data\Manager> <saida>` grava os 55 corpos decifrados como `.bin`, para inspecionar as tabelas ainda sem parser.
 
 ## O "System" editável: esquemas e TSV (módulos `schema` e `tables`, 2026-09-19)
@@ -352,8 +352,8 @@ Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo ca
 Como a pasta `System` do Lineage 2 (`itemname`, `weapongrp`, `armorgrp`, `skillgrp`…): cada tabela `.cdb` decifrada vira um **TSV com cabeçalho e uma coluna por campo**, editável em planilha, e volta a `.cdb` idêntico.
 
 - **Esquema (`schema::Schema`):** lista de colunas nomeadas e tipadas (`u8/u16/u32/u64/i16/i32`, texto de tamanho fixo, bytes em hexadecimal para o que ainda não foi decifrado). Grupos repetidos viram `set_option1_kind`, `level12_max`… A mesma definição serve para ler bytes, escrever TSV e fazer o caminho de volta.
-- **Definições (`tables::schema_for`):** 40 arquivos, seguindo `CommonServer/BaseItem.h` (itens), `CorumOnlineProject/Effect.h` (`BASESKILL`), `struct.h` e `LoginAgent/ItemManager.h`. Cada tamanho de registro foi conferido contra o arquivo do cliente instalado.
-- **Ida e volta [confirmado]:** o teste `every_real_table_round_trips_through_tsv` (com `CORUM_DATA`) faz `.cdb` → TSV → `.cdb` nas 40 tabelas e exige bytes **idênticos** ao original.
+- **Definições (`tables::schema_for`):** 55 arquivos, seguindo `CommonServer/BaseItem.h` (itens), `CorumOnlineProject/Effect.h` (`BASESKILL`), `struct.h` e `LoginAgent/ItemManager.h`. Cada tamanho de registro foi conferido contra o arquivo do cliente instalado.
+- **Ida e volta [confirmado]:** o teste `every_real_table_round_trips_through_tsv` (com `CORUM_DATA`) faz `.cdb` → TSV → `.cdb` nas 55 tabelas e exige bytes **idênticos** ao original.
 - **Texto:** bytes crus (o cliente é GBK); no TSV cada byte vira um caractere Latin-1, o que é idêntico ao ASCII e sem perdas para o resto. `\t`, `\n`, `\r` e `\` são escapados. Um texto maior que o campo é rejeitado.
 - **Regras de edição:** não mudar nome nem ordem das colunas; o número de linhas pode variar. Os ids não são validados (um id repetido ou fora de faixa passa).
 
@@ -367,12 +367,27 @@ Como a pasta `System` do Lineage 2 (`itemname`, `weapongrp`, `armorgrp`, `skillg
 | `Skill` (= `SkillEffect`) | 117 | 346 | habilidades: nome, descrição, alvo, alcance, tempos e 51 níveis (`levelN_min/max/mana/compass/duration/probability`) |
 | `SkillResource`, `itemresource`, `itemstore`, `itemoption` | 110 / 3.058 / 1.660 / 1.117 | 9 / 9 / 3 / 10 | ícones, modelos, lojas e textos de opção |
 | `npctable`, `CPTable`, `Level`, `GuardianLevel`, `BaseClassInfo`, `Help`, `KeyInfo`, `GroupInfo`, `ItemMaking`, `Itemtalisman`… | — | — | NPCs, CP, níveis, ajuda, teclas, grupos, receitas |
+| `questtitle`, `questlist`, `questnpc` | 38 / 218 / 334 | 2 / 13 / 3 | missões: títulos, texto, dica, alvos (`target1..5`) e NPCs |
+| `Hairshopoption` | 192 | 9 | estilos de cabelo da loja (`model_id` = id em `DefResource.erd`, `1001` = `ph101001.MOD`) |
+| `InterfaceResourceInfo`, `InterfaceSpriteManager`, `InterfaceComponentInfo`, `InterfaceFrameInfo` | 496 / 506 / 1.657 / 84 | 7 / 2 / 14 / 3 | interface: arquivos e recortes de imagem, componentes com posição/escala, janelas |
+| `EventDungeonDescription` | 2 | 2 | textos longos de eventos de dungeon |
 
 - **Diferenças entre o código-fonte (2005) e o cliente (2007) [hipótese quanto ao significado]:** `ItemConsumable` tem 3 bytes a mais que `BASEITEM_CONSUMABLE` (um `u16` entre `min_lev` e `max_lev`, sempre 0, e um `u8` final de 0 ou 1: colunas `unknown_min_lev_2` e `unknown_tail`); `ItemBag` tem 4 bytes a mais no fim (`unknown_tail`, sempre 0); `ItemAttrDefine` tem 111 B (texto de 100 B + `unknown_flag`); `Level.cdb` tem 9 B por nível (o `SLEVEL_EXP` do código-fonte, 5 B, vale só para `GuardianLevel`). `Itemtalisman` não tem struct no código-fonte: só o cabeçalho de item foi separado e os 162 B seguintes ficam em `unknown_body` (hex).
 - **Conferência de sentido:** "Marbes' Death Fist" pede nível 192 e dá dano 59–110; "Vaselin's Cross Shower" custa 218.412 (venda 70.353); "Mana Mastery" é passiva (`type=3`) da propriedade 500, como comentam as structs. `ItemWeapon` 327 de 554 armas não pedem nível.
 - **Como usar:** `corum-assets cdb-export-tsv <Data/Manager> <pasta>` gera os TSV; depois de editar, `corum-assets tsv-to-cdb <Tabela> <arquivo.tsv> <saida.cdb>` gera o `.cdb` cifrado (verificado: trocar "Short Sword" por "Espada Curta" e reexportar altera só essa linha; o arquivo mantém o tamanho, 110.250 B). Isso permite um mod do cliente original **e** um cliente Rust que leia os TSV direto.
 - **Limite:** o servidor é quem manda nas regras (dano, preço, drop); editar o cliente só muda o que aparece.
-- **Ainda sem esquema:** `questlist`, `questnpc`, `questtitle`, `Interface*Info`, `Hairshopoption`, `EventDungeonDescription`, os `.cdt` (219) e os pools de texto `Oops` (que já têm `cdb::TextPool`, sem TSV ainda).
+- **Pools de texto e `.cdt`:** `message`, `Cmd_Message`, `Emoticon` e os dois filtros saem como `id<TAB>texto` (com `#prefix=` na primeira linha, os 4 bytes que o cliente ignora); os 213 `.cdt` no formato `ChrInfo` saem juntos em `Cdt.tsv` (ver a seção `.cdt` abaixo). Ficam de fora seis `.cdt` de outro layout (`m00011`, `pm01001`–`pm05001`), que o cliente nunca lê.
+- **Bytes velhos em textos:** alguns campos (`questlist`, `EventDungeonDescription`, `ItemAttrDefine`) guardam sobras depois do NUL, porque o editor original reaproveitava o campo. O TSV mostra essas sobras como `\0` para a ida e volta ser exata; ao editar, dá para apagá-las.
+
+## Tabelas `.cdt` (`Data\Cdt`, módulo `cdt`, 2026-09-19)
+
+Quadros de efeito e sons de cada movimento de um personagem, monstro ou efeito. **Sem cifra.**
+
+- **Formato [confirmado]:** lido por `InitChrInfo` (`GameControl.cpp`) com a struct `ChrInfo` (`ChrInfo.h`): `u32 animações`, `u32 movimentos`, depois `animações × movimentos` registros de **92 bytes**: `u8 quadro_de_efeito[10]`, 2 bytes de padding do compilador (sempre 0) e `10 × (u32 quadro, u32 som)`. O cliente indexa `[animação × movimentos + movimento − 1]` (`ChrInfoLayer::GetFrameInfo`).
+- **Dimensões medidas:** 153 arquivos de monstro `1 × 15` (15 movimentos, os mesmos slots do `.chr`), 55 de efeito/NPC `1 × 1`, e 5 de jogador (`pm01000`–`pm05000`) `9 × 50`: 9 tipos de item na mão × 50 movimentos. `GetFrameInfo(classe−1, tipo_de_item, movimento, n)` devolve o `n`-ésimo quadro-chave do movimento.
+- **Para que serve:** os quadros de efeito marcam o instante do passo (pés no chão: `m00160` movimento 3 tem 15 e 35), do golpe e do som; o sandbox pode usá-los para sincronizar efeitos e poeira com a animação. Nas amostras, 1.878 quadros são não nulos e nenhum som usa o segundo campo (`sound_id`) — **[hipótese]** os sons vêm de outra tabela.
+- **Fora do formato:** `m00011.cdt` (registros de 2 bytes, 1 × 15) e `pm01001`–`pm05001.cdt` (idênticos, 9 × 50 registros de 2 bytes) têm outro layout e nenhum leitor no código do cliente; o parser os recusa e o export os lista como ignorados.
+- **TSV [confirmado a ida e volta]:** `corum-assets cdt-export-tsv <Data/Cdt> <Cdt.tsv>` gera **um** TSV com 4.600 linhas (uma por arquivo, animação e movimento; colunas `file`, `animation`, `motion`, `effect_frame1..10`, `padding`, `sound1_frame`, `sound1_id`…). `corum-assets tsv-to-cdt <Cdt.tsv> <pasta>` recria os `.cdt`; o teste `real_cdt_files_round_trip_through_tsv` exige bytes idênticos nos 213 arquivos.
 
 ## Tabelas de recursos `.erd` (módulo `erd`, 2026-09-19)
 
@@ -385,14 +400,14 @@ Como a pasta `System` do Lineage 2 (`itemname`, `weapongrp`, `armorgrp`, `skillg
 
 ## Exportação completa para montar o cliente
 
-`tools/export_client_data.py <cliente> <saida>` reúne tudo numa pasta (12.707 arquivos, 1,28 GB em 54 s, **fora do git**: `rust-client/export/` está no `.gitignore`):
+`tools/export_client_data.py <cliente> <saida>` reúne tudo numa pasta (12.723 arquivos, 1,28 GB em 54 s, **fora do git**: `rust-client/export/` está no `.gitignore`):
 
 | Pasta | Conteúdo |
 |---|---|
 | `paks/<Pacote>/` | conteúdo dos 13 `.pak` (`.dds` 3.441, `.mod` 2.158, `.anm` 1.819, `.chr` 1.498, `.tif` 683, `.tga` 342, `.vcl` 206, `.lm` 204…) |
 | `loose/` | soltos de `Data`: `Map` (202 `.ttb`, 5 `.map`…), `Cdt` (219), `Sound` (1.054 `.wav`, 31 `.mp3`), `Cursor`, `Manager` |
 | `manager_decoded/` | os 55 `.cdb` decifrados (`.bin`) |
-| `system/` | 40 tabelas em TSV editável (`ItemWeapon.tsv`, `Skill.tsv`…), ver "System" editável |
+| `system/` | 55 tabelas em TSV editável, mais `Cdt.tsv` (`ItemWeapon.tsv`, `Skill.tsv`…), ver "System" editável |
 | `resources/` | os dois `.erd` como `0xID<TAB>caminho` |
 | `config/` | `.erd`, `.ini`, `Paklist.sin` |
 | `manifest.json` | por arquivo: tamanho e sha256; contagem por extensão e por pasta |
@@ -425,6 +440,8 @@ cargo run -p corum-assets -- cdb-info "D:\Games\CorumOnline\Data\Manager\npctabl
 cargo run -p corum-assets -- cdb-decode-all "D:\Games\CorumOnline\Data\Manager" .\target\verification\cdb
 cargo run -p corum-assets -- cdb-export-tsv "D:\Games\CorumOnline\Data\Manager" .\export\system
 cargo run -p corum-assets -- tsv-to-cdb ItemWeapon .\export\system\ItemWeapon.tsv .\ItemWeapon.cdb
+cargo run -p corum-assets -- cdt-export-tsv "D:\Games\CorumOnline\Data\Cdt" .\export\system\Cdt.tsv
+cargo run -p corum-assets -- tsv-to-cdt .\export\system\Cdt.tsv .\cdt_editado
 cargo run -p corum-assets -- erd-dump "D:\Games\CorumOnline\CorumResource.erd"
 
 # exporta tudo para uma pasta só (paks + soltos + cdb decifrados + erd + manifesto; fora do git)

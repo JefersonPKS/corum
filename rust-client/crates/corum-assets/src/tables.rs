@@ -234,6 +234,70 @@ pub fn schema_for(stem: &str) -> Option<Schema> {
             .array("option", 4, Kind::Text(64)),
         "itemstore" => builder.u16("item_id").u8("kind").u16("map_id"),
 
+        // ----- missões (sem struct no código-fonte: layouts lidos dos arquivos) -----
+        "questtitle" => builder.u32("id").text("title", 50),
+        // Registro de 1.039 bytes (218 registros; o "grupo" repete para as etapas da mesma missão).
+        // [hipótese] os campos `unknown_*` ainda não foram decifrados; o resto foi lido a olho nos
+        // textos ("slay 10 Sting Heads and 6 Cavemen" tem os alvos e as contagens 10 e 6).
+        "questlist" => builder
+            .u32("id")
+            .u32("group")
+            .text("title", 50)
+            .text("code", 50)
+            .text("description", 500)
+            .text("hint", 254)
+            .hex("unknown_a", 27)
+            .array("target", 5, Kind::Text(25))
+            .hex("unknown_b", 25),
+        // [hipótese] NPC, missão e um sinalizador (1 = começa/1 = termina).
+        "questnpc" => builder.u32("npc_id").u32("quest_id").u8("flag"),
+        // Dois registros de 2.052 bytes (id + texto de 2.048).
+        "eventdungeondescription" | "eventdungeondescriptiion" => {
+            builder.u32("id").text("description", 2048)
+        }
+        // `model_id` casa com `DefResource.erd` (0x010003E9 = ph101001.MOD).
+        "hairshopoption" => builder
+            .u16("id")
+            .u16("model_id")
+            .text("name", 50)
+            .text("color", 50)
+            .text("note_1", 50)
+            .text("note_2", 50)
+            .text("note_3", 50)
+            .text("note_4", 50)
+            .u8("flag"),
+
+        // ----- interface (InterfaceSpr.h) -----
+        "interfaceresourceinfo" => builder
+            .u16("id")
+            .text("file_name", 50)
+            .u8("type")
+            .u16("left")
+            .u16("top")
+            .u16("right")
+            .u16("bottom"),
+        "interfacespritemanager" => builder.u16("id").u16("resource_id"),
+        "interfacecomponentinfo" => builder
+            .u16("interface_id")
+            .u8("callback_id")
+            .u8("resource_type")
+            .u16("resource_id")
+            .u8("order")
+            .u16("left")
+            .u16("top")
+            .u16("right")
+            .u16("bottom")
+            .f32("scale_x")
+            .f32("scale_y")
+            .u8("value")
+            .u8("pos"),
+        // [hipótese] o arquivo tem 4 bytes a mais que `INTERFACE_FRAME_INFO`; os 13 bytes depois do
+        // nome ficam em hexadecimal até se saber a ordem certa.
+        "interfaceframeinfo" => builder
+            .u16("frame_id")
+            .text("name", 30)
+            .hex("unknown_body", 13),
+
         // ----- habilidades (BASESKILL) -----
         "skill" | "skilleffect" => builder
             .u8("id")
@@ -387,7 +451,14 @@ pub const SCHEMA_FILES: &[&str] = &[
     "GuardianExp",
     "GuardianLevel",
     "Help",
+    "Hairshopoption",
     "helpinfo",
+    "EventDungeonDescriptiion",
+    "EventDungeonDescription",
+    "InterfaceComponentInfo",
+    "InterfaceFrameInfo",
+    "InterfaceResourceInfo",
+    "InterfaceSpriteManager",
     "ItemArmor",
     "ItemAttrDefine",
     "ItemAttrValueList",
@@ -417,6 +488,9 @@ pub const SCHEMA_FILES: &[&str] = &[
     "KeyInfo",
     "Level",
     "npctable",
+    "questlist",
+    "questnpc",
+    "questtitle",
     "Skill",
     "SkillEffect",
     "SkillResource",
@@ -431,7 +505,7 @@ mod tests {
         for name in SCHEMA_FILES {
             assert!(schema_for(name).is_some(), "{name}");
         }
-        assert!(schema_for("questlist").is_none());
+        assert!(schema_for("message").is_none());
     }
 
     /// Com `CORUM_DATA` (pasta `Data` do cliente): todo `.cdb` com esquema tem de fechar em número

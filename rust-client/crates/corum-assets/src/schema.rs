@@ -5,7 +5,9 @@
 //!
 //! **Texto:** campos de texto guardam bytes crus (o cliente chinês usa GBK). No TSV cada byte vira um
 //! caractere `U+0000..U+00FF` (Latin-1), o que é sem perdas e idêntico ao texto em ASCII; `\t`, `\n`,
-//! `\r` e `\` são escapados como `\t`, `\n`, `\r` e `\\`.
+//! `\r`, NUL e `\` são escapados como `\t`, `\n`, `\r`, `\0` e `\\`. Só os zeros do fim do campo são
+//! preenchimento: bytes velhos depois de um NUL (o editor original reaproveitava campos) aparecem como
+//! `\0`, para a ida e volta ser exata.
 
 use std::fmt;
 
@@ -34,6 +36,7 @@ pub enum Kind {
     U64,
     I16,
     I32,
+    F32,
     /// Texto de tamanho fixo terminado em NUL (bytes crus).
     Text(usize),
     /// Bytes ainda não decifrados, em hexadecimal.
@@ -46,7 +49,7 @@ impl Kind {
         match self {
             Self::U8 => 1,
             Self::U16 | Self::I16 => 2,
-            Self::U32 | Self::I32 => 4,
+            Self::U32 | Self::I32 | Self::F32 => 4,
             Self::U64 => 8,
             Self::Text(size) | Self::Hex(size) => size,
         }
@@ -114,6 +117,11 @@ impl Builder {
     #[must_use]
     pub fn i32(self, name: &str) -> Self {
         self.column(name, Kind::I32)
+    }
+
+    #[must_use]
+    pub fn f32(self, name: &str) -> Self {
+        self.column(name, Kind::F32)
     }
 
     #[must_use]
@@ -247,21 +255,16 @@ fn format_field(kind: Kind, field: &[u8], out: &mut String) {
         Kind::I16 => write!(out, "{}", i16::from_le_bytes([field[0], field[1]])),
         Kind::U32 => write!(out, "{}", u32::from_le_bytes(array(field))),
         Kind::I32 => write!(out, "{}", i32::from_le_bytes(array(field))),
+        Kind::F32 => write!(out, "{}", f32::from_le_bytes(array(field))),
         Kind::U64 => write!(out, "{}", u64::from_le_bytes(array(field))),
         Kind::Text(_) => {
+            // Só os zeros do fim são preenchimento: bytes velhos depois de um NUL (campos que o
+            // editor original reaproveitou) ficam visíveis como `\0` para a ida e volta ser exata.
             let end = field
                 .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(field.len());
-            for byte in &field[..end] {
-                match byte {
-                    b'\\' => out.push_str("\\\\"),
-                    b'\t' => out.push_str("\\t"),
-                    b'\n' => out.push_str("\\n"),
-                    b'\r' => out.push_str("\\r"),
-                    other => out.push(char::from(*other)),
-                }
-            }
+                .rposition(|byte| *byte != 0)
+                .map_or(0, |last| last + 1);
+            escape_text(&field[..end], out);
             Ok(())
         }
         Kind::Hex(_) => {
@@ -272,6 +275,42 @@ fn format_field(kind: Kind, field: &[u8], out: &mut String) {
         }
     };
     debug_assert!(written.is_ok(), "writing to a String cannot fail");
+}
+
+/// Bytes → texto do TSV (Latin-1; barra invertida, tab, LF, CR e NUL viram `\\`, `\t`, `\n`, `\r`, `\0`).
+pub fn escape_text(bytes: &[u8], out: &mut String) {
+    for byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0 => out.push_str("\\0"),
+            other => out.push(char::from(*other)),
+        }
+    }
+}
+
+/// O inverso de `escape_text`; erra com um caractere acima de `U+00FF` ou um escape inválido.
+pub fn unescape_text(cell: &str) -> Result<Vec<u8>, &'static str> {
+    let mut bytes = Vec::with_capacity(cell.len());
+    let mut chars = cell.chars();
+    while let Some(character) = chars.next() {
+        let byte = if character == '\\' {
+            match chars.next() {
+                Some('\\') => b'\\',
+                Some('t') => b'\t',
+                Some('n') => b'\n',
+                Some('r') => b'\r',
+                Some('0') => 0,
+                _ => return Err("bad escape in"),
+            }
+        } else {
+            u8::try_from(u32::from(character)).map_err(|_| "character above U+00FF in")?
+        };
+        bytes.push(byte);
+    }
+    Ok(bytes)
 }
 
 fn array<const N: usize>(field: &[u8]) -> [u8; N] {
@@ -304,29 +343,18 @@ fn parse_field(column: &Column, cell: &str, body: &mut Vec<u8>) -> Result<(), St
                 .map_err(|_| bad("not an i32:"))?
                 .to_le_bytes(),
         ),
+        Kind::F32 => body.extend(
+            cell.parse::<f32>()
+                .map_err(|_| bad("not a number:"))?
+                .to_le_bytes(),
+        ),
         Kind::U64 => body.extend(
             cell.parse::<u64>()
                 .map_err(|_| bad("not a u64:"))?
                 .to_le_bytes(),
         ),
         Kind::Text(size) => {
-            let mut bytes = Vec::with_capacity(size);
-            let mut chars = cell.chars();
-            while let Some(character) = chars.next() {
-                let byte = if character == '\\' {
-                    match chars.next() {
-                        Some('\\') => b'\\',
-                        Some('t') => b'\t',
-                        Some('n') => b'\n',
-                        Some('r') => b'\r',
-                        _ => return Err(bad("bad escape in")),
-                    }
-                } else {
-                    u8::try_from(u32::from(character))
-                        .map_err(|_| bad("character above U+00FF in"))?
-                };
-                bytes.push(byte);
-            }
+            let mut bytes = unescape_text(cell).map_err(&bad)?;
             // O campo pode estar cheio (sem NUL); o cliente original trata o último byte como terminador.
             if bytes.len() > size {
                 return Err(bad(&format!("text longer than {size} bytes:")));

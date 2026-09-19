@@ -446,6 +446,9 @@ impl Record for BaseClassInfo {
 /// O cliente indexa por posição na tabela (`GetMessage(índice)`), não pelo `id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextPool {
+    /// Os 4 bytes antes da assinatura: o cliente os ignora, mas variam (`message` = zeros, os outros
+    /// pools = `78 01 37 00`), então são guardados para a ida e volta ser exata.
+    pub prefix: [u8; 4],
     pub entries: Vec<TextEntry>,
 }
 
@@ -489,7 +492,93 @@ impl TextPool {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { entries })
+        Ok(Self {
+            prefix: [decoded[0], decoded[1], decoded[2], decoded[3]],
+            entries,
+        })
+    }
+
+    /// Reconstrói o corpo: textos em sequência, cada um com o seu NUL (assim são todos os arquivos reais).
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let text_size: usize = self
+            .entries
+            .iter()
+            .map(|entry| entry.text.0.len() + 1)
+            .sum();
+        let mut bytes = self.prefix.to_vec();
+        bytes.extend(b"Oops");
+        bytes.extend(
+            u32::try_from(self.entries.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        bytes.extend(u32::try_from(text_size).unwrap_or(u32::MAX).to_le_bytes());
+        let mut position = 0u32;
+        for entry in &self.entries {
+            bytes.extend(entry.id.to_le_bytes());
+            bytes.extend(position.to_le_bytes());
+            position += u32::try_from(entry.text.0.len() + 1).unwrap_or(u32::MAX);
+        }
+        for entry in &self.entries {
+            bytes.extend(&entry.text.0);
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    /// TSV `id<TAB>texto`, precedido de `#prefix=<hex>`; o texto usa o mesmo escape das tabelas.
+    #[must_use]
+    pub fn to_tsv(&self) -> String {
+        let mut tsv = format!(
+            "#prefix={}\nid\ttext\n",
+            self.prefix
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        for entry in &self.entries {
+            tsv.push_str(&entry.id.to_string());
+            tsv.push('\t');
+            crate::schema::escape_text(&entry.text.0, &mut tsv);
+            tsv.push('\n');
+        }
+        tsv
+    }
+
+    pub fn from_tsv(tsv: &str) -> Result<Self, CdbError> {
+        let mut lines = tsv.lines().peekable();
+        let mut prefix = [0; 4];
+        if let Some(line) = lines.next_if(|line| line.starts_with("#prefix=")) {
+            let hex = &line["#prefix=".len()..];
+            let valid = hex.len() == 8 && hex.is_ascii();
+            if !valid {
+                return Err(CdbError::new("`#prefix=` needs 8 hexadecimal digits"));
+            }
+            for (index, slot) in prefix.iter_mut().enumerate() {
+                *slot = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+                    .map_err(|_| CdbError::new("`#prefix=` is not hexadecimal"))?;
+            }
+        }
+        if lines.next() != Some("id\ttext") {
+            return Err(CdbError::new("expected the header `id<TAB>text`"));
+        }
+        let mut entries = Vec::new();
+        for (row, line) in lines.enumerate() {
+            let (id, text) = line
+                .split_once('\t')
+                .ok_or_else(|| CdbError::new(format!("row {} has no tab", row + 1)))?;
+            let id = id
+                .parse::<u32>()
+                .map_err(|_| CdbError::new(format!("row {}: `{id}` is not an id", row + 1)))?;
+            let text = crate::schema::unescape_text(text)
+                .map_err(|what| CdbError::new(format!("row {}: {what} the text", row + 1)))?;
+            entries.push(TextEntry {
+                id,
+                text: FixedText(text),
+            });
+        }
+        Ok(Self { prefix, entries })
     }
 }
 
@@ -552,6 +641,50 @@ mod tests {
         let bytes = std::fs::read(manager.join("message.cdb")).unwrap();
         let pool = TextPool::parse(&decode(&bytes).unwrap()).unwrap();
         assert_eq!(pool.entries.len(), 1823);
+    }
+
+    /// Com `CORUM_DATA`: cada pool de texto real volta idêntico depois de pool → TSV → pool → `.cdb`.
+    #[test]
+    fn real_text_pools_round_trip_through_tsv() {
+        let Some(data) = std::env::var_os("CORUM_DATA") else {
+            return;
+        };
+        for name in [
+            "message.cdb",
+            "Cmd_Message.cdb",
+            "Emoticon.cdb",
+            "Filter_Conv_Message.cdb",
+            "Filter_NotConv_Message.cdb",
+        ] {
+            let original =
+                std::fs::read(std::path::Path::new(&data).join("Manager").join(name)).unwrap();
+            let pool = TextPool::parse(&decode(&original).unwrap()).unwrap();
+            let again = TextPool::from_tsv(&pool.to_tsv()).unwrap();
+            assert_eq!(again, pool, "{name}");
+            assert_eq!(encode(&again.to_bytes()), original, "{name}");
+        }
+    }
+
+    #[test]
+    fn text_pool_tsv_escapes_and_keeps_the_prefix() {
+        let pool = TextPool {
+            prefix: [1, 2, 3, 4],
+            entries: vec![
+                TextEntry {
+                    id: 0,
+                    text: FixedText(b"a\tb\nc\\d".to_vec()),
+                },
+                TextEntry {
+                    id: 7,
+                    text: FixedText(Vec::new()),
+                },
+            ],
+        };
+        let tsv = pool.to_tsv();
+        assert!(tsv.starts_with("#prefix=01020304\nid\ttext\n0\ta\\tb\\nc\\\\d\n7\t\n"));
+        assert_eq!(TextPool::from_tsv(&tsv).unwrap(), pool);
+        assert_eq!(TextPool::parse(&pool.to_bytes()).unwrap(), pool);
+        assert!(TextPool::from_tsv("id\ttext\nx\ty\n").is_err());
     }
 
     #[test]

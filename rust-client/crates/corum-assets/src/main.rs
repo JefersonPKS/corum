@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use corum_assets::cdb::{self, Record};
+use corum_assets::cdt::Cdt;
 use corum_assets::chr::ChrManifest;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::MapScript;
@@ -53,6 +54,8 @@ fn run() -> Result<(), String> {
         "tsv-to-cdb" if arguments.len() == 4 => {
             tsv_to_cdb(&arguments[1], &arguments[2], &arguments[3])
         }
+        "cdt-export-tsv" if arguments.len() == 3 => cdt_export_tsv(&arguments[1], &arguments[2]),
+        "tsv-to-cdt" if arguments.len() == 3 => tsv_to_cdt(&arguments[1], &arguments[2]),
         "erd-dump" if arguments.len() == 2 => erd_dump(&arguments[1]),
         "cdb-decode-all" if arguments.len() == 3 => cdb_decode_all(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
@@ -173,21 +176,28 @@ fn cdb_export_tsv(directory: &str, output: &str) -> Result<(), String> {
         let is_cdb = path
             .extension()
             .is_some_and(|extension| extension.eq_ignore_ascii_case("cdb"));
-        let Some(schema) = is_cdb.then(|| tables::schema_for(&stem)).flatten() else {
+        if !is_cdb {
             continue;
-        };
+        }
         let decoded = cdb::decode(&fs::read(&path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let tsv = schema
-            .to_tsv(&decoded)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        let rows = tsv.lines().count() - 1;
+        let (tsv, columns) = match tables::schema_for(&stem) {
+            Some(schema) => {
+                let tsv = schema
+                    .to_tsv(&decoded)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+                (tsv, schema.columns().len())
+            }
+            // Sem esquema de registros: pode ser um pool de textos (`Oops`).
+            None => match cdb::TextPool::parse(&decoded) {
+                Ok(pool) => (pool.to_tsv(), 2),
+                Err(_) => continue,
+            },
+        };
+        let rows = tsv.lines().filter(|line| !line.starts_with('#')).count() - 1;
         fs::write(Path::new(output).join(format!("{stem}.tsv")), tsv)
             .map_err(|error| error.to_string())?;
-        done.push(format!(
-            "{stem} ({rows} rows, {} columns)",
-            schema.columns().len()
-        ));
+        done.push(format!("{stem} ({rows} rows, {columns} columns)"));
     }
     done.sort();
     for line in &done {
@@ -198,11 +208,67 @@ fn cdb_export_tsv(directory: &str, output: &str) -> Result<(), String> {
 }
 
 fn tsv_to_cdb(table: &str, tsv_path: &str, cdb_path: &str) -> Result<(), String> {
-    let schema = tables::schema_for(table).ok_or_else(|| format!("no schema for `{table}`"))?;
     let tsv = fs::read_to_string(tsv_path).map_err(|error| error.to_string())?;
-    let body = schema.from_tsv(&tsv).map_err(|error| error.to_string())?;
+    // Tabela com esquema de registros, ou (sem esquema) pool de textos.
+    let body = match tables::schema_for(table) {
+        Some(schema) => schema.from_tsv(&tsv).map_err(|error| error.to_string())?,
+        None => cdb::TextPool::from_tsv(&tsv)
+            .map_err(|error| {
+                format!("`{table}` has no record schema and is not a text pool: {error}")
+            })?
+            .to_bytes(),
+    };
     fs::write(cdb_path, cdb::encode(&body)).map_err(|error| error.to_string())?;
     println!("wrote {cdb_path} ({} bytes of table data)", body.len());
+    Ok(())
+}
+
+fn cdt_export_tsv(directory: &str, output: &str) -> Result<(), String> {
+    let mut paths: Vec<_> = fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cdt"))
+        })
+        .collect();
+    paths.sort();
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for path in paths {
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        match Cdt::parse(&fs::read(&path).map_err(|error| error.to_string())?) {
+            Ok(cdt) => files.push((name, cdt)),
+            Err(_) => skipped.push(name),
+        }
+    }
+    let tsv = corum_assets::cdt::to_tsv(&files).map_err(|error| error.to_string())?;
+    fs::write(output, &tsv).map_err(|error| error.to_string())?;
+    println!(
+        "{} .cdt files, {} rows in {output}; skipped (other layout): {}",
+        files.len(),
+        tsv.lines().count() - 1,
+        skipped.join(", ")
+    );
+    Ok(())
+}
+
+fn tsv_to_cdt(tsv_path: &str, output: &str) -> Result<(), String> {
+    let tsv = fs::read_to_string(tsv_path).map_err(|error| error.to_string())?;
+    let files = corum_assets::cdt::from_tsv(&tsv).map_err(|error| error.to_string())?;
+    fs::create_dir_all(output).map_err(|error| error.to_string())?;
+    for (name, cdt) in &files {
+        fs::write(
+            Path::new(output).join(format!("{name}.cdt")),
+            cdt.to_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    println!("wrote {} .cdt files to {output}", files.len());
     Ok(())
 }
 
@@ -665,6 +731,8 @@ fn usage() -> String {
         "  corum-assets cdb-info <table.cdb>",
         "  corum-assets cdb-export-tsv <Data/Manager> <output-dir>",
         "  corum-assets tsv-to-cdb <table-name> <table.tsv> <output.cdb>",
+        "  corum-assets cdt-export-tsv <Data/Cdt> <output.tsv>",
+        "  corum-assets tsv-to-cdt <table.tsv> <output-dir>",
         "  corum-assets erd-dump <resource.erd>",
         "  corum-assets cdb-decode-all <Data/Manager> <output-dir>",
         "  corum-assets map-info <scene.map>",

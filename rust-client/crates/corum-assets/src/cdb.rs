@@ -97,7 +97,7 @@ pub fn parse_table<T: Record>(decoded: &[u8]) -> Result<Vec<T>, CdbError> {
 pub struct FixedText(pub Vec<u8>);
 
 impl FixedText {
-    fn from_field(field: &[u8]) -> Self {
+    pub(crate) fn from_field(field: &[u8]) -> Self {
         let end = field
             .iter()
             .position(|byte| *byte == 0)

@@ -138,6 +138,12 @@ impl Skeleton {
         self.ids.iter().position(|candidate| *candidate == id)
     }
 
+    /// Index of the node with this name (`Bip01 R Hand`, the bone the client attaches weapons to).
+    #[must_use]
+    pub fn index_of_name(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|candidate| candidate == name)
+    }
+
     #[must_use]
     pub fn bind_world(&self) -> &[Matrix] {
         &self.bind_world

@@ -389,6 +389,30 @@ Quadros de efeito e sons de cada movimento de um personagem, monstro ou efeito. 
 - **Fora do formato:** `m00011.cdt` (registros de 2 bytes, 1 × 15) e `pm01001`–`pm05001.cdt` (idênticos, 9 × 50 registros de 2 bytes) têm outro layout e nenhum leitor no código do cliente; o parser os recusa e o export os lista como ignorados.
 - **TSV [confirmado a ida e volta]:** `corum-assets cdt-export-tsv <Data/Cdt> <Cdt.tsv>` gera **um** TSV com 4.600 linhas (uma por arquivo, animação e movimento; colunas `file`, `animation`, `motion`, `effect_frame1..10`, `padding`, `sound1_frame`, `sound1_id`…). `corum-assets tsv-to-cdt <Cdt.tsv> <pasta>` recria os `.cdt`; o teste `real_cdt_files_round_trip_through_tsv` exige bytes idênticos nos 213 arquivos.
 
+## Itens: id → nome e modelo 3D (módulo `items`, 2026-09-19)
+
+Como o cliente original acha o modelo de um item (`ItemDataName` e `ItemAttach`, em `CorumOnlineProject/CodeFun.cpp`):
+
+1. **Id do item** (`u16`) é o mesmo nas tabelas de item (`ItemWeapon`, `ItemArmor`, ...) e no `ItemResource.cdb`.
+2. `ItemResource` dá `model_file` (`w0001`), o tipo de recurso (0 = `.mod`, 1 = `.chr` animado), o número de modelos e o ícone.
+3. O arquivo é `<model_file>_<NNN>.mod` (ou `.chr`), `NNN` = índice do modelo a partir de 0 (`w0001_000.mod`). Fica no pacote `Item` (ou `Character` quando quem chama pede).
+4. O item é preso a um osso do personagem: `Bip01 R Hand` (mão direita), `Bip01 L Hand` ou `Bip01 Head`.
+
+- **Catálogo (`items::ItemCatalog`)** junta as 17 tabelas de item (todas começam com o cabeçalho de 94 bytes de `CBaseItem`: id, nome "coreano" de 50 B, nome inglês de 35 B) com o `ItemResource`: 2.945 itens, 2.933 com recurso. `model_entry(id, índice)` devolve o nome do arquivo como o cliente o monta.
+- **CLI:** `corum-assets item-info <Data> <id>` (tabela, nomes, recurso e em qual pacote o modelo existe) e `corum-assets item-check <Data>` (cobertura por tabela).
+- **Cobertura medida (índice 0):**
+
+| Tabela | Itens | Com nome de modelo | Modelo achado em `Item`/`Character` |
+|---|---:|---:|---:|
+| `ItemWeapon` | 554 | 546 | **546** |
+| `ItemArmor` | 1.246 | 666 | 575 (o resto usa outro índice por classe/sexo, ex.: `pm1146_000`, `pm1146_003`) |
+| `ItemRide` | 1 | 1 | 1 |
+| demais tipos (poções, materiais, especiais, bags...) | 1.144 | 0 | — (só ícone; o modelo 3D do chão é genérico) |
+
+- **Regra do pivô [confirmado visualmente]:** o modelo de uma arma é desenhado **longe da origem** (a espada `w0001_000` fica em x ≈ −190, y de 88 a 180) e o seu único nó tem a translação de mundo em (−200,9; 100,6; 18,9), rotação identidade. O motor prende o **pivô do nó** ao osso. Por isso o vértice usado é `vértice × inversa do nó` (vira "vértice − pivô") e depois a matriz do osso na pose atual. Sem essa correção a espada fica a ~1,5 unidade da mão.
+- **Orientação [hipótese]:** com o eixo do osso `Bip01 R Hand` e o modelo como estão, a lâmina sai da mão para a frente; falta comparar com o cliente original para ver se é a empunhadura correta (não foi aplicada nenhuma rotação extra).
+- **Limites:** armaduras vêm em partes (sem montagem ainda: C6); itens `.chr` são mostrados na pose de bind, sem o `.anm` próprio; o item `812` (garra "Marbes' Death Fist") tem uma malha de layout ainda não decifrado (das ~150 conhecidas) e só o plano `add1` aparece.
+
 ## Tabelas de recursos `.erd` (módulo `erd`, 2026-09-19)
 
 `CorumResource.erd` e `DefResource.erd` (raiz do cliente) ligam **id de recurso → caminho de arquivo**, como os comentários de `CorumOnlineProject/DefResource.h` sugerem (`167782161 // .\Data\Map\worldmap1.cdb`).
@@ -442,6 +466,8 @@ cargo run -p corum-assets -- cdb-export-tsv "D:\Games\CorumOnline\Data\Manager" 
 cargo run -p corum-assets -- tsv-to-cdb ItemWeapon .\export\system\ItemWeapon.tsv .\ItemWeapon.cdb
 cargo run -p corum-assets -- cdt-export-tsv "D:\Games\CorumOnline\Data\Cdt" .\export\system\Cdt.tsv
 cargo run -p corum-assets -- tsv-to-cdt .\export\system\Cdt.tsv .\cdt_editado
+cargo run -p corum-assets -- item-info "D:\Games\CorumOnline\Data" 1
+cargo run -p corum-assets -- item-check "D:\Games\CorumOnline\Data"
 cargo run -p corum-assets -- erd-dump "D:\Games\CorumOnline\CorumResource.erd"
 
 # exporta tudo para uma pasta só (paks + soltos + cdb decifrados + erd + manifesto; fora do git)

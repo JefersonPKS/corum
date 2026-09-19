@@ -12,9 +12,10 @@ use bytemuck::{Pod, Zeroable};
 use corum_assets::PakArchive;
 use corum_assets::chr::ChrManifest;
 use corum_assets::dds::DecodedImage;
+use corum_assets::items::ItemCatalog;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::{MapLight, MapObject, MapScript};
-use corum_assets::model::ModelFile;
+use corum_assets::model::{Matrix, ModelFile};
 use corum_assets::motion::MotionFile;
 use corum_assets::pose::{Skeleton, transform_point, transform_vector};
 use corum_assets::stm::StaticModelFile;
@@ -105,6 +106,7 @@ fn run() -> Result<(), String> {
     scene.props = load_props(&path, &scene.map);
     scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
+    scene.held_item = HeldItem::load(&path, scene.player_model.as_ref(), tile_size);
     // Debug: `CORUM_PLAYER_AT=x,z` starts the player at those map-script coordinates, to point
     // the camera at a specific spot in repeatable screenshots.
     if let Some([x, z]) = env::var("CORUM_PLAYER_AT").ok().and_then(|value| {
@@ -425,6 +427,7 @@ struct SandboxScene {
     show_props: bool,
     player_model: Option<ActorModel>,
     mob_model: Option<ActorModel>,
+    held_item: Option<HeldItem>,
     player_yaw: f32,
     mob_yaw: f32,
     /// Multiplier for baked lighting (VCL and lightmaps): 1.0, or 2.0 to compare an
@@ -488,6 +491,7 @@ impl SandboxScene {
             show_props: true,
             player_model: None,
             mob_model: None,
+            held_item: None,
             player_yaw: 0.0,
             mob_yaw: 0.0,
             baked_gain: 1.0,
@@ -552,6 +556,9 @@ impl SandboxScene {
         }
         if let Some(model) = &mut self.player_model {
             model.animate(delta, self.moving);
+            if let (Some(rig), Some(held)) = (&model.rig, &mut self.held_item) {
+                held.follow(rig);
+            }
         }
         if let Some(model) = &mut self.mob_model {
             model.animate(delta, true);
@@ -650,8 +657,13 @@ impl SandboxScene {
             return Vec::new();
         }
         let (model, position, yaw) = match kind {
-            ActorKind::Player => (&self.player_model, self.player, self.player_yaw),
-            ActorKind::Mob => (&self.mob_model, self.mob, self.mob_yaw),
+            ActorKind::Player => (self.player_model.as_ref(), self.player, self.player_yaw),
+            ActorKind::Mob => (self.mob_model.as_ref(), self.mob, self.mob_yaw),
+            ActorKind::Held => (
+                self.held_item.as_ref().map(|held| &held.model),
+                self.player,
+                self.player_yaw,
+            ),
         };
         let Some(model) = model else {
             return Vec::new();
@@ -1489,10 +1501,14 @@ impl Renderer {
                     .props
                     .iter()
                     .any(|batch| batch.vertices.iter().any(is_class))
-                || [&scene.player_model, &scene.mob_model]
-                    .into_iter()
-                    .flatten()
-                    .any(|model| model.vertices.iter().any(is_class))
+                || [
+                    scene.player_model.as_ref(),
+                    scene.mob_model.as_ref(),
+                    scene.held_item.as_ref().map(|held| &held.model),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|model| model.vertices.iter().any(is_class))
         };
         let uses_blend = [has_class(BLEND_ALPHA), has_class(BLEND_ADDITIVE)];
         let vertex_capacity = scene.maximum_vertex_count();
@@ -1523,8 +1539,12 @@ impl Renderer {
             .collect();
         let mut actors = Vec::new();
         for (kind, model) in [
-            (ActorKind::Player, &scene.player_model),
-            (ActorKind::Mob, &scene.mob_model),
+            (ActorKind::Player, scene.player_model.as_ref()),
+            (ActorKind::Mob, scene.mob_model.as_ref()),
+            (
+                ActorKind::Held,
+                scene.held_item.as_ref().map(|held| &held.model),
+            ),
         ] {
             let Some(model) = model else {
                 continue;
@@ -1762,6 +1782,8 @@ impl DepthTarget {
 enum ActorKind {
     Player,
     Mob,
+    /// The item held in the player's hand, following a bone of the player's skeleton.
+    Held,
 }
 
 /// A textured `.MOD` in sandbox units with the origin at its feet. Its vertices start in the
@@ -1795,6 +1817,8 @@ struct Rig {
     corners: Vec<(u32, u32)>,
     /// Model units to sandbox units.
     scale: f32,
+    /// World matrix of every node in the pose last shown (the bind pose until a motion plays).
+    pose: Vec<Matrix>,
     /// One entry per `.chr` slot; `None` for a missing or blank (`blank_player_ani`) motion.
     motions: Vec<Option<MotionFile>>,
     idle: Option<usize>,
@@ -1905,6 +1929,7 @@ impl ActorModel {
         rig.clock += delta;
         let tracks = rig.skeleton.tracks_for(motion);
         let pose = rig.skeleton.pose(&tracks, motion.frame_at(rig.clock));
+        rig.pose.clone_from(&pose);
         // `inverse bind * posed world` moves a point from the bind pose to the posed one.
         let moves: Vec<_> = (0..pose.len())
             .map(|node| rig.skeleton.rigid_matrix(node, &pose))
@@ -2069,6 +2094,7 @@ impl ActorModel {
             return Err("the model has no decodable mesh".to_owned());
         }
         let rig = skeleton.map(|skeleton| Rig {
+            pose: skeleton.bind_world().to_vec(),
             skeleton,
             meshes: rig_meshes,
             corners: corner_sources,
@@ -2084,6 +2110,123 @@ impl ActorModel {
             textures,
             rig,
         })
+    }
+}
+
+/// An item model (weapon) attached to a bone of the player's skeleton, like `ItemAttach` in the
+/// original client (`CodeFun.cpp`): the item's origin sits on the bone and moves with it.
+struct HeldItem {
+    model: ActorModel,
+    /// The item's vertices in its own space, before the bone matrix is applied.
+    local: Vec<Vertex>,
+    bone: usize,
+}
+
+impl HeldItem {
+    /// Reads `CORUM_ITEM=<id>` (an item of the game tables), finds its model through
+    /// `ItemResource` and attaches it to `CORUM_ITEM_BONE` (default `Bip01 R Hand`, where the
+    /// client puts weapons). `CORUM_ITEM_MODEL` picks the model index (default 0).
+    fn load(ttb_path: &Path, player: Option<&ActorModel>, tile_size: f32) -> Option<Self> {
+        let id: u16 = env::var("CORUM_ITEM").ok()?.trim().parse().ok()?;
+        let rig = player?.rig.as_ref()?;
+        let bone_name = env::var("CORUM_ITEM_BONE").unwrap_or_else(|_| "Bip01 R Hand".to_owned());
+        let Some(bone) = rig.skeleton.index_of_name(&bone_name) else {
+            eprintln!("CORUM_ITEM: the player model has no bone `{bone_name}`");
+            return None;
+        };
+        let index: u16 = env::var("CORUM_ITEM_MODEL")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let directory = data_directories(ttb_path)
+            .into_iter()
+            .find(|directory| directory.join("Manager").join("ItemResource.cdb").is_file())?;
+        let catalog = ItemCatalog::load(&directory.join("Manager"))
+            .map_err(|error| eprintln!("CORUM_ITEM: {error}"))
+            .ok()?;
+        let name = catalog
+            .items
+            .get(&id)
+            .map_or_else(String::new, |item| item.name_eng.lossy());
+        let Some(entry) = catalog.model_entry(id, index) else {
+            eprintln!("CORUM_ITEM: item {id} ({name}) has no 3D model");
+            return None;
+        };
+        for package in ["Item", "Character"] {
+            let Ok(archive) = open_data_package(ttb_path, package) else {
+                continue;
+            };
+            let Ok(mut bytes) = archive.read_entry(&entry) else {
+                continue;
+            };
+            // Animated items (`.chr`) are a manifest that names the `.mod`; the sandbox shows
+            // the bind pose of the model and ignores the item's own motions.
+            if entry.ends_with(".chr") {
+                let Ok(manifest) = ChrManifest::parse(&bytes) else {
+                    continue;
+                };
+                let Ok(model_bytes) = archive.read_entry(&manifest.model_file) else {
+                    eprintln!("CORUM_ITEM: {} is not in {package}", manifest.model_file);
+                    continue;
+                };
+                bytes = model_bytes;
+            }
+            let packages = TexturePackages {
+                dds: vec![archive.clone()],
+                tif: vec![archive],
+            };
+            match ActorModel::from_bytes(&bytes, &packages, tile_size, false) {
+                Ok(model) => {
+                    // The model is authored away from the origin: the engine fixes the pivot of
+                    // its node (the node's world translation) to the bone, so the vertices are
+                    // moved into the node's own space first.
+                    let inverse = ModelFile::parse(&bytes)
+                        .ok()
+                        .and_then(|parsed| parsed.nodes.first().map(|node| node.inverse));
+                    let units = 1.0 / rig.scale;
+                    let local: Vec<Vertex> = model
+                        .vertices
+                        .iter()
+                        .map(|vertex| {
+                            let mut moved = *vertex;
+                            if let Some(inverse) = &inverse {
+                                let model_point = Vec3::from_array(vertex.position) * units;
+                                moved.position = (Vec3::from_array(transform_point(
+                                    inverse,
+                                    model_point.to_array(),
+                                )) * rig.scale)
+                                    .to_array();
+                                moved.normal = transform_vector(inverse, vertex.normal);
+                            }
+                            moved
+                        })
+                        .collect();
+                    eprintln!(
+                        "holding item {id} \"{name}\": {package}/{entry} on `{bone_name}`, {} triangles",
+                        model.vertices.len() / 3
+                    );
+                    return Some(Self { model, local, bone });
+                }
+                Err(error) => eprintln!("CORUM_ITEM: {entry}: {error}"),
+            }
+        }
+        eprintln!("CORUM_ITEM: {entry} is not in the Item or Character packages");
+        None
+    }
+
+    /// Moves the item with its bone in the player's current pose.
+    fn follow(&mut self, rig: &Rig) {
+        let Some(mut matrix) = rig.pose.get(self.bone).copied() else {
+            return;
+        };
+        // The bone matrix is in model units; the item's vertices already are in sandbox units.
+        for value in &mut matrix[3][..3] {
+            *value *= rig.scale;
+        }
+        for (placed, local) in self.model.vertices.iter_mut().zip(&self.local) {
+            placed.position = transform_point(&matrix, local.position);
+            placed.normal = transform_vector(&matrix, local.normal);
+        }
     }
 }
 

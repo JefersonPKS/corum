@@ -3,6 +3,7 @@
 use corum_assets::cdb::{self, Record};
 use corum_assets::cdt::Cdt;
 use corum_assets::chr::ChrManifest;
+use corum_assets::items::ItemCatalog;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::MapScript;
 use corum_assets::model::ModelFile;
@@ -56,6 +57,8 @@ fn run() -> Result<(), String> {
         }
         "cdt-export-tsv" if arguments.len() == 3 => cdt_export_tsv(&arguments[1], &arguments[2]),
         "tsv-to-cdt" if arguments.len() == 3 => tsv_to_cdt(&arguments[1], &arguments[2]),
+        "item-info" if arguments.len() == 3 => item_info(&arguments[1], &arguments[2]),
+        "item-check" if arguments.len() == 2 => item_check(&arguments[1]),
         "erd-dump" if arguments.len() == 2 => erd_dump(&arguments[1]),
         "cdb-decode-all" if arguments.len() == 3 => cdb_decode_all(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
@@ -269,6 +272,102 @@ fn tsv_to_cdt(tsv_path: &str, output: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     }
     println!("wrote {} .cdt files to {output}", files.len());
+    Ok(())
+}
+
+/// Pacotes onde o cliente procura o modelo de um item (`DATA_TYPE_ITEM`, ou `Character` se `byDir`).
+fn item_packages(data: &Path) -> Vec<PakArchive> {
+    ["Item", "Character"]
+        .iter()
+        .filter_map(|name| PakArchive::open(data.join(name).join(format!("{name}.pak"))).ok())
+        .collect()
+}
+
+fn item_info(data: &str, id: &str) -> Result<(), String> {
+    let data = Path::new(data);
+    let id: u16 = id
+        .parse()
+        .map_err(|_| format!("`{id}` is not an item id"))?;
+    let catalog = ItemCatalog::load(&data.join("Manager")).map_err(|error| error.to_string())?;
+    let item = catalog
+        .items
+        .get(&id)
+        .ok_or_else(|| format!("no item {id}"))?;
+    println!("id: {id}");
+    println!("table: {}", item.table);
+    println!("name: {}", item.name_eng.lossy());
+    println!("name_kor: {}", item.name_kor.lossy());
+    match catalog.resources.get(&id) {
+        Some(resource) => println!(
+            "resource: icon={} index={} count={}, model={} ({} models, type {}, animated {})",
+            resource.icon_file.lossy(),
+            resource.icon_start_index,
+            resource.icon_count,
+            resource.model_file.lossy(),
+            resource.model_count,
+            resource.resource_type,
+            resource.animation
+        ),
+        None => println!("resource: none"),
+    }
+    let packages = item_packages(data);
+    for index in 0..catalog
+        .resources
+        .get(&id)
+        .map_or(0, |resource| resource.model_count)
+    {
+        if let Some(entry) = catalog.model_entry(id, index) {
+            let found = ["Item", "Character"]
+                .iter()
+                .zip(&packages)
+                .find(|(_, pak)| pak.read_entry(&entry).is_ok())
+                .map(|(name, _)| *name);
+            println!(
+                "model {index}: {entry} in {}",
+                found.unwrap_or("(not found)")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn item_check(data: &str) -> Result<(), String> {
+    let data = Path::new(data);
+    let catalog = ItemCatalog::load(&data.join("Manager")).map_err(|error| error.to_string())?;
+    let packages = item_packages(data);
+    let mut per_table: std::collections::BTreeMap<&str, [usize; 4]> =
+        std::collections::BTreeMap::new();
+    for item in catalog.items.values() {
+        let counts = per_table.entry(item.table).or_default();
+        counts[0] += 1;
+        let Some(resource) = catalog.resources.get(&item.id) else {
+            continue;
+        };
+        counts[1] += 1;
+        let Some(entry) = catalog.model_entry(item.id, 0) else {
+            continue;
+        };
+        counts[2] += 1;
+        if packages.iter().any(|pak| pak.read_entry(&entry).is_ok()) {
+            counts[3] += 1;
+        }
+        let _ = resource;
+    }
+    println!("table                 items  resource  model_name  model_found");
+    let mut total = [0; 4];
+    for (table, counts) in &per_table {
+        println!(
+            "{table:20} {:6} {:9} {:11} {:12}",
+            counts[0], counts[1], counts[2], counts[3]
+        );
+        for (sum, value) in total.iter_mut().zip(counts) {
+            *sum += value;
+        }
+    }
+    println!(
+        "{:20} {:6} {:9} {:11} {:12}",
+        "total", total[0], total[1], total[2], total[3]
+    );
     Ok(())
 }
 
@@ -733,6 +832,8 @@ fn usage() -> String {
         "  corum-assets tsv-to-cdb <table-name> <table.tsv> <output.cdb>",
         "  corum-assets cdt-export-tsv <Data/Cdt> <output.tsv>",
         "  corum-assets tsv-to-cdt <table.tsv> <output-dir>",
+        "  corum-assets item-info <Data> <item-id>",
+        "  corum-assets item-check <Data>",
         "  corum-assets erd-dump <resource.erd>",
         "  corum-assets cdb-decode-all <Data/Manager> <output-dir>",
         "  corum-assets map-info <scene.map>",

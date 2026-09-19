@@ -9,6 +9,25 @@ const MESH_NAME_OFFSET: usize = 0xC4;
 const MESH_COUNTS_OFFSET: usize = 0x144;
 const POSITIONS_OFFSET: usize = 0x174;
 
+/// Row-vector 4x4 matrix (Direct3D style): translation in the last row.
+pub type Matrix = [[f32; 4]; 4];
+
+/// A node of the model's hierarchy: a mesh or a bone.
+///
+/// Both kinds start with the same header. Word 0 is the node's **identifier** (counting down
+/// through the file), word 48 the identifier of its **parent** (`-1` for the root), words
+/// 15..30 the world matrix of the bind pose and words 31..46 its inverse; skin records name
+/// bones by identifier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelNode {
+    pub id: i32,
+    pub parent_id: i32,
+    pub name: String,
+    pub is_bone: bool,
+    pub world: Matrix,
+    pub inverse: Matrix,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelFile {
     pub version: u32,
@@ -18,6 +37,8 @@ pub struct ModelFile {
     pub materials: Vec<ModelMaterial>,
     pub meshes: Vec<ModelMesh>,
     pub bones: Vec<String>,
+    /// Every mesh and bone in file order (children come before their parents).
+    pub nodes: Vec<ModelNode>,
     pub unsupported_records: Vec<ModelRecordSummary>,
 }
 
@@ -33,7 +54,13 @@ pub struct ModelMaterial {
 pub struct ModelMesh {
     pub name: String,
     pub flags: u32,
-    pub parent_index: i32,
+    /// Node identifier (word 0 of the record; it was once misread as a parent index).
+    pub id: i32,
+    /// Identifier of the parent node, `-1` for the root.
+    pub parent_id: i32,
+    /// World matrix of the node in the bind pose.
+    pub world: Matrix,
+    pub inverse: Matrix,
     pub vertex_count: u32,
     pub texture_vertex_count: u32,
     pub seam_vertex_count: u32,
@@ -60,6 +87,29 @@ pub struct MeshGeometry {
     /// vertex it duplicates. Skin weights are stored for the first `T` vertices, so this is
     /// how a seam vertex inherits them. Empty for meshes without seams.
     pub seam_sources: Vec<u32>,
+    /// Skin influences of every vertex, when the mesh is skinned.
+    pub skin: Option<MeshSkin>,
+}
+
+/// Per-vertex skin data. Position at any pose:
+/// `sum(weight * (offset, 1) * posed_world[bone])`, which at the bind pose reproduces the
+/// mesh's position array (exactly, in 247 of the 495 skinned meshes checked; the rest differ by
+/// under two units because the stored pose is not exactly the bind pose).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MeshSkin {
+    /// `V` lists (seam vertices point at the same records as their source).
+    pub influences: Vec<Vec<Influence>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Influence {
+    /// Identifier of the bone node.
+    pub bone_id: i32,
+    pub weight: f32,
+    /// Vertex position in the bone's own space.
+    pub offset: [f32; 3],
+    /// Vertex normal in the bone's own space.
+    pub normal: [f32; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +192,7 @@ impl ModelFile {
         cursor = checked_add(cursor, 4, cursor)?;
         let mut meshes = Vec::with_capacity(declared_mesh_count);
         let mut bones = Vec::new();
+        let mut nodes = Vec::new();
         let mut unsupported_records = Vec::new();
         let mut first_record = true;
         while cursor < bytes.len() {
@@ -151,17 +202,40 @@ impl ModelFile {
             let payload = checked_add(cursor, 8, cursor)?;
             require(bytes, payload, payload_size)?;
             match tag {
-                MESH_RECORD_TAG => meshes.push(parse_mesh(
-                    &bytes[payload..payload + payload_size],
-                    payload,
-                    if first_record { first_flags } else { 0 },
-                )?),
+                MESH_RECORD_TAG => {
+                    let mesh = parse_mesh(
+                        &bytes[payload..payload + payload_size],
+                        payload,
+                        if first_record { first_flags } else { 0 },
+                    )?;
+                    nodes.push(ModelNode {
+                        id: mesh.id,
+                        parent_id: mesh.parent_id,
+                        name: mesh.name.clone(),
+                        is_bone: false,
+                        world: mesh.world,
+                        inverse: mesh.inverse,
+                    });
+                    meshes.push(mesh);
+                }
                 NODE_RECORD_TAG => {
                     let name = if payload_size >= MESH_NAME_OFFSET + 128 {
                         c_string(bytes, payload + MESH_NAME_OFFSET, 128)?
                     } else {
                         String::new()
                     };
+                    if let Ok(header) =
+                        read_node_header(&bytes[payload..payload + payload_size], payload)
+                    {
+                        nodes.push(ModelNode {
+                            id: header.id,
+                            parent_id: header.parent_id,
+                            name: name.clone(),
+                            is_bone: true,
+                            world: header.world,
+                            inverse: header.inverse,
+                        });
+                    }
                     bones.push(name);
                 }
                 _ if tag & 0xF000_0000 == 0xF000_0000 => {
@@ -222,6 +296,7 @@ impl ModelFile {
             materials,
             meshes,
             bones,
+            nodes,
             unsupported_records,
         })
     }
@@ -296,7 +371,7 @@ impl ModelFile {
 fn parse_mesh(bytes: &[u8], absolute: usize, flags: u32) -> Result<ModelMesh, ModelError> {
     require_local(bytes, absolute, 0, POSITIONS_OFFSET)?;
     let name = c_string_local(bytes, absolute, MESH_NAME_OFFSET, 128)?;
-    let parent_index = i32_at_local(bytes, absolute, 0)?;
+    let header = read_node_header(bytes, absolute)?;
     let vertex_count = u32_at_local(bytes, absolute, MESH_COUNTS_OFFSET)?;
     let texture_vertex_count = u32_at_local(bytes, absolute, MESH_COUNTS_OFFSET + 8)?;
     let seam_vertex_count = u32_at_local(bytes, absolute, MESH_COUNTS_OFFSET + 12)?;
@@ -328,13 +403,43 @@ fn parse_mesh(bytes: &[u8], absolute: usize, flags: u32) -> Result<ModelMesh, Mo
     Ok(ModelMesh {
         name,
         flags,
-        parent_index,
+        id: header.id,
+        parent_id: header.parent_id,
+        world: header.world,
+        inverse: header.inverse,
         vertex_count,
         texture_vertex_count,
         seam_vertex_count,
         pivot,
         geometry,
         geometry_issue,
+    })
+}
+
+/// The header every node record starts with (see [`ModelNode`]).
+struct NodeHeader {
+    id: i32,
+    parent_id: i32,
+    world: Matrix,
+    inverse: Matrix,
+}
+
+fn read_node_header(bytes: &[u8], absolute: usize) -> Result<NodeHeader, ModelError> {
+    require_local(bytes, absolute, 0, POSITIONS_OFFSET)?;
+    let matrix = |first_word: usize| -> Result<Matrix, ModelError> {
+        let mut matrix = [[0.0_f32; 4]; 4];
+        for (row, cells) in matrix.iter_mut().enumerate() {
+            for (column, cell) in cells.iter_mut().enumerate() {
+                *cell = f32_at_local(bytes, absolute, (first_word + row * 4 + column) * 4)?;
+            }
+        }
+        Ok(matrix)
+    };
+    Ok(NodeHeader {
+        id: i32_at_local(bytes, absolute, 0)?,
+        parent_id: i32_at_local(bytes, absolute, 48 * 4)?,
+        world: matrix(15)?,
+        inverse: matrix(31)?,
     })
 }
 
@@ -451,12 +556,74 @@ fn parse_geometry(
         ));
     }
 
+    let skin = parse_skin(bytes, cursor, vertices, regular_uvs);
     Ok(MeshGeometry {
         positions,
         texture_coordinates,
         face_groups,
         seam_sources,
+        skin,
     })
+}
+
+/// The block after the face groups of a skinned mesh:
+///
+/// ```text
+/// V, T, T                       (u32 x 3)
+/// V entries of 5 bytes          influence count (u8), index of the first record (u32)
+/// N records of 32 bytes         bone id (u32), weight (f32), offset (3 x f32), normal (3 x f32)
+/// V normals of 12 bytes         (not read)
+/// ```
+///
+/// `N` is whatever the size leaves over. Returns `None` for meshes without skin (whose block is
+/// just three zero words and the normals) or when the block does not add up.
+fn parse_skin(bytes: &[u8], cursor: usize, vertices: usize, regular: usize) -> Option<MeshSkin> {
+    const ENTRY: usize = 5;
+    const RECORD: usize = 32;
+    let read_u32 = |offset: usize| -> Option<u32> {
+        bytes
+            .get(offset..offset.checked_add(4)?)
+            .map(|value| u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    };
+    let read_f32 = |offset: usize| read_u32(offset).map(f32::from_bits);
+    let matches = |offset: usize, expected: usize| {
+        read_u32(offset).and_then(|value| usize::try_from(value).ok()) == Some(expected)
+    };
+    if !(matches(cursor, vertices) && matches(cursor + 4, regular) && matches(cursor + 8, regular))
+    {
+        return None;
+    }
+    let table = cursor + 12;
+    let records_start = table.checked_add(vertices.checked_mul(ENTRY)?)?;
+    let records_size = bytes
+        .len()
+        .checked_sub(records_start)?
+        .checked_sub(vertices.checked_mul(12)?)?;
+    if records_size % RECORD != 0 {
+        return None;
+    }
+    let record_count = records_size / RECORD;
+    let mut influences = Vec::with_capacity(vertices);
+    for vertex in 0..vertices {
+        let entry = table + vertex * ENTRY;
+        let count = usize::from(*bytes.get(entry)?);
+        let first = usize::try_from(read_u32(entry + 1)?).ok()?;
+        if count == 0 || first.checked_add(count)? > record_count {
+            return None;
+        }
+        let mut list = Vec::with_capacity(count);
+        for record in first..first + count {
+            let at = records_start + record * RECORD;
+            list.push(Influence {
+                bone_id: i32::try_from(read_u32(at)?).ok()?,
+                weight: read_f32(at + 4)?,
+                offset: [read_f32(at + 8)?, read_f32(at + 12)?, read_f32(at + 16)?],
+                normal: [read_f32(at + 20)?, read_f32(at + 24)?, read_f32(at + 28)?],
+            });
+        }
+        influences.push(list);
+    }
+    Some(MeshSkin { influences })
 }
 
 fn obj_name(name: &str) -> String {
@@ -689,6 +856,7 @@ mod tests {
                 .collect(),
             meshes: Vec::new(),
             bones: Vec::new(),
+            nodes: Vec::new(),
             unsupported_records: Vec::new(),
         }
     }

@@ -205,9 +205,12 @@ Regras de arquitetura:
   conferidos nos 196 mapas empacotados (0 erros; `.vcl` exato em 195; `.lm` sem
   divergência em 196) e há decodificadores de DDS e de TIFF para as texturas.
   O sandbox já usa modelos reais (NPC humano e monstro alado, texturizados e na
-  pose de bind, ainda sem animação) e coloca nos mapas os objetos do `.map`
+  e animados) e coloca nos mapas os objetos do `.map`
   (10.282 em 158 mapas: árvores, casas, cercas, ruínas), com água translúcida e
-  fogo aditivo. Céu, sombras de atores e skinning/animação ainda faltam. O roteiro detalhado de mapa, luz e
+  fogo aditivo. O esqueleto (hierarquia e bind), a pele (influências por vértice) e as trilhas
+  do `.ANM` foram decifrados e o sandbox **anima** o personagem, o mob e os objetos `.CHR` do
+  mapa (NPC humano, diabrete alado, ogro de armadura, fogo). Céu, sombras de atores, pele na
+  GPU e as animações de ataque/dano/morte ainda faltam. O roteiro detalhado de mapa, luz e
   sombra, mobs e personagem está em `rust-client/docs/VISUAL_ROADMAP.md`.
 - A prova gráfica atual cobre malhas estáticas diretamente decodificáveis. O
   próximo bloqueio visual é o cenário `.STM`; para personagens reais, é o

@@ -6,6 +6,7 @@ pub mod lightmap;
 pub mod map_script;
 pub mod model;
 pub mod motion;
+pub mod pose;
 pub mod stm;
 pub mod tiff;
 pub mod ttb;

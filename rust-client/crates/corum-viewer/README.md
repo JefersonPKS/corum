@@ -127,7 +127,7 @@ Para apontar a câmera para um ponto (por exemplo uma fogueira), use `CORUM_PLAY
 
 Os objetos listados no `.map` (árvores, casas, cercas, barris, ruínas, fogueiras) são
 desenhados a partir de `Map_chr.pak`: os `.MOD` direto e os `.CHR` pelo modelo que o
-manifesto aponta (pose de bind, sem animação). Cada modelo único vira um lote com as instâncias
+manifesto aponta (os `.CHR` animam, ver "Animação"). Cada modelo único vira um lote com as instâncias
 já em coordenadas de mundo (escala, rotação Y e posição do script), com as suas texturas
 (`Map_chr`, depois `Map_dds` e `Map_tif`). Como os atores, recebem o ambiente e as luzes
 pontuais, e não têm cor assada. A tecla `O` mostra ou oculta os objetos. O sandbox imprime
@@ -136,11 +136,21 @@ pontuais, e não têm cor assada. A tecla `O` mostra ou oculta os objetos. O san
 Verificados na tela: `5` (vila: 43 objetos, casas, pinheiros e arbustos), `604` (savana com
 ilhas: 713 objetos em 10 modelos) e `750` (2 objetos). Fogo e água: ver a seção acima.
 
+### Animação
+
+O personagem, o mob e os objetos `.CHR` do mapa **animam**. Cada ator carrega o `.chr` do modelo e os `.anm` que ele lista, e a cada quadro o sandbox calcula a pose do esqueleto e reposiciona os vértices na CPU: vértices com pele por `soma(peso × inversa_do_bind × mundo_animado)`, peças rígidas pelo próprio nó. Detalhes do formato em "Nós, esqueleto e pele" e "Animação" no README do `corum-assets`.
+
+- **Slots por pacote:** parado/andando são `Monster` 0/2 (`STAND1`/`MOVE1`), `Character` 0/6 (`STAND1`... `WALK`) e `Npc` 0/nenhum (um movimento só). O personagem anda com o movimento de andar enquanto você o move e volta ao parado ao soltar; o mob patrulha sempre com o de andar. `CORUM_PLAYER_ANIM=idle,andar` e `CORUM_MOB_ANIM=idle,andar` escolhem os slots (0-based). Ex.: `CORUM_PLAYER=Monster/m00160.mod` com `CORUM_PLAYER_ANIM=2,2` mostra a caminhada do ogro.
+- **Objetos `.CHR` do mapa** (fogueiras, tochas, bandeiras) tocam o primeiro movimento real em repetição. Só lotes com até 60.000 vértices (todas as instâncias juntas) animam, porque são reposicionados e reenviados à GPU a cada quadro; lotes maiores ficam na pose de bind.
+- **Verificado na tela:** o NPC humano `npc007` (mãos e braços mudam durante os 7,5 s do idle), o diabrete alado `m00010`, o ogro de armadura `m00160` (perfil de caminhada) e o fogo do `604` (a chama sobe e a fumaça se desloca).
+
+**Limites:** não há mistura entre movimentos (a troca parado/andar é seca), a velocidade do movimento não acompanha a do personagem, alguns fragmentos rígidos de armas ficam soltos (a maça do ogro), a pele é feita na CPU (a GPU só recebe os vértices prontos) e nenhum movimento de ataque, dano ou morte é disparado ainda.
+
 ### Personagem e mob reais
 
-O personagem controlável e o mob em patrulha são modelos `.MOD` reais e texturizados, na
-**pose de bind** (as posições cruas desses modelos já são a pose de bind; o skinning ainda não é
-aplicado, então eles não animam). Cada modelo pega as texturas do seu próprio pacote
+O personagem controlável e o mob em patrulha são modelos `.MOD` reais e texturizados. Eles
+começam na **pose de bind** (as posições cruas dos modelos já são o bind) e animam (ver
+"Animação"). Cada modelo pega as texturas do seu próprio pacote
 (`.dds`, às vezes `.tif`), tem normais suaves, recebe o ambiente e as luzes pontuais do mapa e
 gira para a direção em que anda. Padrões: `Npc/npc007.mod` (humano) e `Monster/m00010.mod`
 (diabrete alado). Para trocar, use `Pacote/arquivo.mod` (pacotes `Npc`, `Monster`, `Character`,
@@ -191,9 +201,6 @@ O passo a passo (com ordem, critérios de aceite e riscos) está em [`docs/VISUA
 - normais por vértice do `.STM` (hoje a normal é a da face);
 - fundo/céu e névoa (hoje é uma cor sólida) e materiais de água/transparência.
 
-Os modelos `.MOD` de personagens, monstros e NPCs já são decodificados em 93 a 100% das
-malhas (ver `corum-assets/README.md`), mas ainda sem textura e **sem pose**: cada malha
-aparece nas suas coordenadas locais, então modelos de uma peça (monstro alado, NPC humanoide)
-saem com a forma certa e personagens de várias peças saem sobrepostos. A próxima etapa é
-aplicar a hierarquia de nós (`pivot`, `parent_index`, ossos `F5`), carregar a textura do
-material e combinar o manifesto `.CHR` com a animação `.ANM`.
+Os modelos `.MOD` de personagens, monstros e NPCs são decodificados em 93 a 100% das
+malhas, com textura, esqueleto, pele e animação (ver `corum-assets/README.md`). A próxima etapa
+é misturar movimentos, disparar ataque/dano/morte pelos slots do `.chr` e levar a pele para a GPU.

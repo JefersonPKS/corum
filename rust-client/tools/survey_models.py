@@ -14,6 +14,9 @@ Estado registrado em 2026-09-19 (o total de malhas conta cada registro `F4`):
     Map_chr    7.000 de 7.051 malhas (99%), 363 de 378 modelos completos
     Monster    1.202 de 1.219 malhas (99%), 176 de 189 modelos completos
     Npc           45 de 45 malhas (100%),    22 de 22 modelos completos
+
+`malhas_com_pele` conta as malhas cujo bloco de influências (osso, peso, offset) foi lido: 167 em
+`Character`, 303 em `Monster`, 25 em `Npc` e 5 em `Map_chr`.
 """
 import collections
 import re
@@ -74,6 +77,7 @@ def main() -> int:
             ok = sum("exportable=true" in line for line in meshes)
             total["malhas"] += len(meshes)
             total["malhas_ok"] += ok
+            total["malhas_com_pele"] += sum("skinned=true" in line for line in meshes)
             if meshes and ok == len(meshes):
                 total["modelos_completos"] += 1
             for line in meshes:

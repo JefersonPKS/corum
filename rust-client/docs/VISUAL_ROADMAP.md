@@ -72,12 +72,12 @@ Estado do formato (2026-09-19): a geometria (posições, UVs, costuras e faces) 
 |---|---|---|---|
 | C0 ✅ | **Mostrar modelos reais** | Feito, no visualizador e no **sandbox de mapa**: o personagem é um NPC humano texturizado (`Npc/npc007`) e o mob, um diabrete alado (`Monster/m00010`), ambos na pose de bind, com luz e normais suaves, girando para onde andam; escolhidos por `CORUM_PLAYER`/`CORUM_MOB`. Verificado com 4 modelos de 2 pacotes | Cumprido: modelos reais e texturizados no sandbox |
 | C1 ✅ (geometria) | **Decodificar costuras e geometria do `.MOD`** | Feito: as "costuras" são `S` UVs extras (`T + S = V`), seguidos de `S` índices de origem, e os grupos de faces usam o cabeçalho do STM (28 bytes) com triângulos `u16` sem preenchimento. 93–100% das malhas decodificam (ver README do `corum-assets`). **Aberto:** ~150 malhas com layout diferente, o restante do payload (normais, registros por grupo) e os **pesos de skinning** | Cumprido para a geometria; pesos em C3/C4 |
-| C2 | Semântica das tracks do `.ANM` | **[hipótese]** `track_24` = rotação (quaternion), `track_20` = posição ou escala (3 floats), `track_36` = posição + quaternion; a quinta é morph por vértice. Confirmar animando um osso simples e comparando visualmente | Animação de idle reconhecível |
-| C3 | Esqueleto: hierarquia `F5` (ossos/nós) e pose de bind | **Correção:** a pose de bind já está nas posições cruas dos modelos, então o C3 deixou de ser pré-requisito para mostrar modelos. Continua necessário para animar: a matriz de cada osso vem do `F5`/`pivot`/`parent_index` e das tracks do `.ANM` | Ossos posicionados sobre o modelo |
-| C4 | Skinning na GPU (até N ossos por vértice). Os pesos ficam na cauda do payload `F4` (ver README do `corum-assets`): registros `osso, peso, posição local, normal local` nas malhas pequenas, tabela ainda não decifrada nas grandes | Buffer de matrizes por instância; começar com CPU se ajudar a depurar | Mob caminhando com o modelo correto |
+| C2 ✅ | Semântica das tracks do `.ANM` | Feito: `track_24` é rotação (quaternion, matriz = transposta da do D3DX), `track_20` é posição local; chaves de posição vêm **antes** das de rotação no arquivo; casamento por nome; uma chave por quadro. `track_36` não apareceu (**[hipótese]** posição + quaternion). O sinal veio de comparar o quaternion do quadro 0 com a rotação local do bind (erro 0,001–0,008) | Cumprido |
+| C3 ✅ | Esqueleto: hierarquia e pose de bind | Feito: word 0 = identificador, word 48 = pai, words 15–30 = mundo do bind, 31–46 = inversa (`pose::Skeleton`); sem trilhas a pose reproduz o bind com erro 0,0000 | Cumprido |
+| C4 ✅ (CPU) | Skinning | Feito na CPU: bloco de pele decifrado (`V, T, T` + tabela de 5 bytes por vértice + registros `osso, peso, offset, normal` de 32 bytes); 500 malhas com pele. NPC humano, diabrete e ogro animam no sandbox. **Falta:** pele na GPU, mistura entre movimentos, e as peças rígidas soltas (maça do ogro) | Cumprido para a CPU |
 | C5 | Parser de `.CDB`/`.CDT` (tabelas de Manager) | Necessário para ligar "monstro N" a `.chr`, tamanho, animação de idle/andar/ataque. O cliente instalado tem 56 arquivos em `Data\Manager` (a maioria `.cdb`) e 219 `.cdt` em `Data\Cdt`. O cliente instalado é de 2007 e algumas tabelas diferem do repositório (ver o plano principal); usar as do cliente | Dado um id de monstro, sabemos modelo e animações |
 | C6 | Personagem: montagem por partes (corpo, cabeça, armadura) e troca de equipamento | 905 modelos de `Character`; a convenção de nomes (`pm1245_005.chr`) provavelmente codifica classe/parte **[hipótese]**. Requer C5 para a tabela de itens | Personagem completo no sandbox |
-| C7 | Integração com o sandbox: mob com patrulha usando o modelo real e a animação de andar; personagem controlável com animação por movimento | O sandbox já tem colisão TTB e input | Cena jogável local |
+| C7 ✅ (parcial) | Integração com o sandbox: mob com patrulha usando o modelo real e a animação de andar; personagem controlável com animação por movimento | Feito: personagem e mob trocam entre parado e andar; objetos `.CHR` tocam em repetição. Faltam correr, ataque, dano e morte | Cumprido para andar |
 | C8 | Ligar ao servidor | Só depois dos Marcos 1 e 2 do plano (protocolo). Posições e spawns passam a vir de pacotes | Marco 3/4 do plano |
 
 Ordem sugerida: **C0 → C1 → C2 → C3 → C4 → C7**, com C5 em paralelo (independente de gráfico) e C6 depois.
@@ -89,10 +89,10 @@ Há três trilhas que quase não dependem uma da outra:
 | Trilha | Primeira entrega | Bloqueia |
 |---|---|---|
 | Mapa e luz (A + B) | B1 (VCL) e B2 (luzes) no sandbox | nada |
-| Formatos de modelo (C1–C3) | Geometria já decifrada; falta a pose, os pesos e a animação | mobs e personagem animados |
+| Formatos de modelo (C1–C4) | Geometria, esqueleto, pele e animação decifrados; falta a GPU e o mapeamento de ações | ataque/dano/morte no sandbox |
 | Dados de jogo (C5) e protocolo (Marcos 1–2 do plano) | Parser de CDB; login por CLI | integração com servidor |
 
-Recomendação: a iluminação assada (B1–B4, A1, A2), os modelos parados e texturizados (C0, C1) e os objetos posicionados (A4) estão prontos. Seguir com o **skinning e a animação** (decifrar a cauda do `F4`, as tracks do `.ANM`, C2–C4) e com o **C5** (tabelas CDB: qual modelo é qual monstro/personagem).
+Recomendação: a iluminação assada (B1–B4, A1, A2), os modelos texturizados (C0, C1), os objetos posicionados (A4), a água e o fogo (A6, A10) e a animação (C2–C4, C7 para andar) estão prontos. Seguir com o **C5** (tabelas CDB: qual modelo é qual monstro/personagem e qual movimento é qual ação), o **C6** (personagem por partes e equipamentos) e as **animações de ataque, dano e morte**, com a **pele na GPU** quando o número de atores pedir.
 
 ## Riscos e decisões pendentes
 

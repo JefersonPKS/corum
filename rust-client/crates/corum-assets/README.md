@@ -106,6 +106,32 @@ Antes eram 53, 338, 22 e 0. Confirmado na tela: um monstro alado (`Monster_m0063
   - malhas **com esqueleto** têm mais dados, de tamanho variável, e não seguem nenhuma fórmula linear em `V`, `F`, `G` ou `T` (ajuste por mínimos quadrados com erro máximo de ~30 KB). Nas menores (`V = 4`) a cauda é um cabeçalho de 8 palavras `V, T, T, 1, 0x10100, ?, ?, nº de ossos usados`, depois **um registro de 8 palavras por vértice** `osso (u32), peso (1.0), posição local ao osso (3 × f32), normal local (3 × f32)`, e no fim as `V × 12` normais **[hipótese, lida a olho em uma malha de 4 vértices]**. Malhas grandes (a lula `Character_pm1277`, 1.216 vértices, 27 ossos) têm uma tabela com passo regular (`3, 7, 11, 15…` e `1025, 2049, 3073…`) que ainda não foi decifrada;
 - pesos de skinning e a ligação de cada malha a um osso. **Correção:** as posições cruas dos modelos já são a **pose de bind** (um NPC humano, um monstro alado, um diabrete e um espectro saem inteiros sem aplicar nenhum osso), então não é preciso hierarquia de nós para *mostrar* o modelo parado. A hierarquia (`F5`, `pivot`, `parent_index`) e o skinning só entram para **animar**. A aparência "embaralhada" de `Character_pm1277_000` era uma lula de tentáculos abertos, não um erro.
 
+### Nós, esqueleto e pele (decifrado em 2026-09-19)
+
+**Nós.** Cada registro de malha (`F4`) e de osso (`F5`) começa com o mesmo cabeçalho de `0x174` bytes, lido por `ModelNode`:
+
+| Palavra | Conteúdo |
+|---:|---|
+| 0 | **identificador** do nó (`i32`, contando para baixo pelo arquivo: 41, 40, … 0) |
+| 15–30 | **matriz de mundo** 4×4 da pose de bind (vetor-linha, translação na última linha) |
+| 31–46 | a **inversa** dessa matriz (`mundo × inversa = I`, erro medido 1e-5) |
+| 48 | identificador do **pai** (`-1` na raiz) |
+
+A palavra 0 já foi lida como "índice do pai" (`parent_index`); era o identificador. Os filhos vêm antes dos pais no arquivo. A matriz local do bind é `mundo × inversa_do_pai`, e a pose é `mundo(t) = local(t) × mundo_do_pai(t)` (`pose::Skeleton`). Sem nenhuma trilha, a pose reproduz o bind **exatamente** (erro 0,0000 medido em dois modelos). A hierarquia de um monstro (`m00160`) tem 42 nós: 16 malhas e 26 ossos de um Biped do 3ds Max, e as pernas do ogro pendem do `Spine`, não do `Pelvis`.
+
+**Pele.** Depois dos grupos de faces de uma malha com esqueleto vem um bloco (`MeshGeometry::skin`):
+
+```text
+V, T, T                    (u32 x 3)
+V entradas de 5 bytes      nº de influências (u8), índice do primeiro registro (u32)
+N registros de 32 bytes    identificador do osso (u32), peso (f32), offset (3 x f32), normal (3 x f32)
+V normais de 12 bytes      (não lidas)
+```
+
+`N` é o que sobra do tamanho. O offset e a normal estão no espaço do próprio osso, e a posição do vértice é `soma(peso × (offset, 1) × mundo_do_osso)`. Os vértices de costura usam as mesmas entradas do vértice de origem. Verificado contra as posições guardadas no bind, em 495 malhas com esqueleto: **247 reconstroem com erro menor que 0,01**; nas demais a mediana do erro é 0,03 e 90% ficam abaixo de 9 unidades (a pose guardada nas posições não é exatamente a das matrizes dos nós). Isso vale para 167 malhas de `Character`, 303 de `Monster`, 25 de `Npc` e 5 de `Map_chr` (`corum-assets mod-info` mostra `skinned=true`). A maioria dos vértices tem 1 influência; há vértices com 2 a 4 (pesos 0,5, 0,33, 0,25), e um segundo osso pode ter peso 0.
+
+As malhas **sem** bloco de pele são peças rígidas: seguem o próprio nó (`inversa_do_bind × mundo_animado`).
+
 ### ANM versão 1
 
 O cabeçalho de 160 bytes contém versão, ticks por frame, primeiro/último frame, velocidade, duração e nome. Em seguida aparecem registros com tag `0x0000F000` e tamanho explícito.
@@ -118,7 +144,9 @@ Três tipos de keyframe foram separados por tamanho:
 | `track_20` | 20 | tick, índice e três `f32` |
 | `track_36` | 36 | tick, índice e sete `f32` |
 
-As três semânticas finais ainda serão confirmadas contra o motor, mas a divisão binária é consistente: 3.875 registros sem morph do pacote `Effect` obedecem exatamente a essa equação, sem divergências. Todos os 197 ANM de `Effect` e os 259 de `Character` são aceitos. A quinta track é morph por vértice e tem tamanho dependente da malha; por enquanto o parser preserva sua contagem e extensão sem interpretá-la.
+**Semântica das trilhas (confirmada em 2026-09-19, ver "Animação" abaixo):** `track_24` é a **rotação** (quaternion `x, y, z, w`), `track_20` é a **posição local** (relativa ao pai; a raiz `Bip01` usa `track_20` com a posição absoluta) e `track_36` não apareceu em nenhum arquivo medido. As chaves são uma por quadro (`frame_index` de 0 a `last_frame`). **Ordem no arquivo:** quando um registro tem os dois tipos, as chaves de 20 bytes (posição) vêm **antes** das de 24 bytes (rotação), embora `counters` liste a contagem de rotação primeiro. Ler na ordem inversa mantém todos os totais de bytes válidos (por isso a validação antiga passava) e desalinha a segunda trilha.
+
+A divisão binária original é consistente: 3.875 registros sem morph do pacote `Effect` obedecem exatamente a essa equação, sem divergências. Todos os 197 ANM de `Effect` e os 259 de `Character` são aceitos. A quinta track é morph por vértice e tem tamanho dependente da malha; por enquanto o parser preserva sua contagem e extensão sem interpretá-la.
 
 ## Texturas (DDS e TIFF)
 
@@ -284,6 +312,16 @@ O conteúdo é iluminação: um cinza uniforme (`0x4228`, ≈ RGB 66/69/66) com 
 
 Fica em aberto: o significado do primeiro campo e se o valor de fábrica do cinza (`0x4228`) é um ambiente constante do mapa.
 
+### Animação (2026-09-19)
+
+- **Nós por nome:** os registros do `.ANM` casam com os nós do `.MOD` pelo nome (`Bip01 R Calf`, `Object09`…). Nós sem trilha seguem o pai; um monstro típico tem 16 a 24 dos 42 nós animados.
+- **Quaternion:** a matriz de rotação é a **transposta** da do `D3DXMatrixRotationQuaternion` (as trilhas guardam a rotação inversa, convenção do 3ds Max). Medido no ogro: convertendo o quaternion do quadro 0, o erro contra a rotação local do bind é de 0,001 a 0,008 nos ossos; com a matriz do D3DX seria de 0,3 a 1,7.
+- **Amostragem:** interpolação linear das posições e `slerp` (caminho mais curto) das rotações entre chaves, mantendo a primeira/última fora do intervalo; o movimento repete (`MotionFile::frame_at`). Um monstro tem 60 quadros a 24 por segundo no idle (2,5 s) e 20 a 45 nos outros.
+- **Slots do `.chr`:** cada slot é um tipo de ação, de 1 em diante, então o slot é `tipo − 1`. Constantes do cliente original (`GameDefine.h`): monstros `STAND1 = 1, STAND2 = 2, MOVE1 = 3, MOVE2 = 4, ATTACK1..4 = 5..8, DEFENSE1 = 9, OFENSEFAIL = 10..11, DEFENSEFAIL = 12..14, DOWN = 15` (os nomes `m00160_01`, `_03`, `_04`, `_05` casam); personagens `VILLAGESTAND = 1, DUNGEONSTAND = 2, WARSTAND = 3, STAND1 = 4, STAND2 = 5, VILLAGEWALK = 6, WALK = 7, RUN = 8, RUNSTOP = 9, ATTACK1..2 = 10..11, CASTINGSKILL = 12…`; NPCs têm um único movimento. Slots sem arquivo apontam para `blank_player_ani.anm` (5 quadros, nenhuma trilha).
+- **Consistência (`corum-assets pose-check <mod> <anm>`):** com as trilhas na ordem certa, o comprimento dos ossos varia entre 0,4 e 4,6 unidades ao longo de três movimentos do ogro (antes da correção da ordem chegava a 84), e a maior variação é do `Footsteps`, que se move de verdade. O primeiro quadro de um idle está a 90–170 unidades do bind (o bind é uma pose aberta): isso não é erro.
+
+Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo campo do cabeçalho de grupo) e o campo de 5 bytes por vértice guardam além de "contagem e primeiro registro"; e o que faz algumas peças rígidas de armas (a maça do ogro) ficarem soltas: suspeita-se que a matriz de mundo guardada nas malhas não seja a do bind para todas **[hipótese]**.
+
 ## Uso
 
 ```powershell
@@ -295,6 +333,7 @@ cargo run -p corum-assets -- chr-info .\extracted\dfymiss.chr
 cargo run -p corum-assets -- mod-info .\extracted\dfymiss.mod
 cargo run -p corum-assets -- mod-to-obj .\extracted\dfymiss.mod .\dfymiss.obj
 cargo run -p corum-assets -- anm-info .\extracted\dfmiss.anm
+cargo run -p corum-assets -- pose-check .\extracted\m00160.mod .\extracted\m00160_03.anm
 cargo run -p corum-assets -- extract-all "D:\Games\CorumOnline\Data\Map_stm\Map_stm.pak" .\maps
 
 # mapas (aceitam arquivos soltos ou extraídos)

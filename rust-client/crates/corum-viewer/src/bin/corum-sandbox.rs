@@ -15,6 +15,8 @@ use corum_assets::dds::DecodedImage;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::{MapLight, MapObject, MapScript};
 use corum_assets::model::ModelFile;
+use corum_assets::motion::MotionFile;
+use corum_assets::pose::{Skeleton, transform_point, transform_vector};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
 use corum_assets::vcl::VertexColors;
@@ -128,6 +130,22 @@ fn run() -> Result<(), String> {
 
 /// Loads the actor named by `variable` (or `default`), given as `Package/entry`. A model that
 /// cannot be found falls back to the placeholder boxes.
+/// `CORUM_PLAYER_ANIM` / `CORUM_MOB_ANIM` = `idle,moving` picks the `.chr` motion slots
+/// (0-based; `-` for none) instead of the package defaults.
+fn motion_slots_override(package: &str, variable: &str) -> (Option<usize>, Option<usize>) {
+    let defaults = default_motion_slots(package);
+    let Ok(value) = env::var(variable) else {
+        return defaults;
+    };
+    let mut parts = value
+        .split(',')
+        .map(|part| part.trim().parse::<usize>().ok());
+    (
+        parts.next().unwrap_or(defaults.0),
+        parts.next().unwrap_or(defaults.1),
+    )
+}
+
 fn load_actor(
     ttb_path: &Path,
     variable: &str,
@@ -142,7 +160,13 @@ fn load_actor(
         eprintln!("{variable}='{spec}' must look like Package/entry.mod");
         return None;
     };
-    match ActorModel::load(ttb_path, package, entry, tile_size) {
+    match ActorModel::load(
+        ttb_path,
+        package,
+        entry,
+        tile_size,
+        &format!("{variable}_ANIM"),
+    ) {
         Ok(model) => Some(model),
         Err(error) => {
             eprintln!("actor {spec} unavailable: {error}");
@@ -511,6 +535,27 @@ impl SandboxScene {
             self.move_player(direction * speed * delta);
         }
         self.update_mob(delta);
+        for batch in &mut self.props {
+            let Some(animated) = &mut batch.animated else {
+                continue;
+            };
+            animated.model.animate(delta, true);
+            batch.vertices.clear();
+            for object in &animated.instances {
+                append_instance(
+                    &mut batch.vertices,
+                    &animated.model.vertices,
+                    object,
+                    &self.map,
+                );
+            }
+        }
+        if let Some(model) = &mut self.player_model {
+            model.animate(delta, self.moving);
+        }
+        if let Some(model) = &mut self.mob_model {
+            model.animate(delta, true);
+        }
     }
 
     fn move_player(&mut self, movement: Vec3) {
@@ -1467,7 +1512,7 @@ impl Renderer {
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("sandbox prop vertices"),
                     contents: bytemuck::cast_slice(&batch.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 });
                 PropGpu {
                     bind_group,
@@ -1563,6 +1608,12 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
             self.vertex_count = vertices.len() as u32;
+        }
+        for (prop, batch) in self.props.iter().zip(&self.scene.props) {
+            if batch.animated.is_some() {
+                self.queue
+                    .write_buffer(&prop.buffer, 0, bytemuck::cast_slice(&batch.vertices));
+            }
         }
         for actor in &mut self.actors {
             let placed = self.scene.actor_vertices(actor.kind);
@@ -1713,17 +1764,64 @@ enum ActorKind {
     Mob,
 }
 
-/// A textured `.MOD` in its bind pose, in sandbox units with the origin at its feet.
-///
-/// Skinning is not applied (the weights are not decoded yet), so it stands still: the raw
-/// vertex positions of these models already are the bind pose.
+/// A textured `.MOD` in sandbox units with the origin at its feet. Its vertices start in the
+/// bind pose (the raw vertex positions already are the bind pose); actors loaded with a rig are
+/// re-posed every frame from a `.ANM`.
 struct ActorModel {
     vertices: Vec<Vertex>,
     textures: MapTextures,
+    rig: Option<Rig>,
+}
+
+/// Posed positions and normals of one mesh, in sandbox units.
+type PosedMesh = (Vec<[f32; 3]>, Vec<[f32; 3]>);
+
+/// One mesh of a rigged model, in model units.
+struct RigMesh {
+    /// Node index of the mesh itself, used when the mesh has no skin (it then follows its node).
+    node: usize,
+    rest_positions: Vec<Vec3>,
+    rest_normals: Vec<Vec3>,
+    /// Per vertex: `(node index, weight)` of each bone that moves it. `None` for rigid meshes.
+    influences: Option<Vec<Vec<(usize, f32)>>>,
+}
+
+/// Everything needed to animate an actor: the skeleton, the meshes with their skin, which
+/// triangle corner comes from which mesh vertex, and the motions with their playback state.
+struct Rig {
+    skeleton: Skeleton,
+    meshes: Vec<RigMesh>,
+    /// For each entry of `ActorModel::vertices`: `(mesh, vertex)`.
+    corners: Vec<(u32, u32)>,
+    /// Model units to sandbox units.
+    scale: f32,
+    /// One entry per `.chr` slot; `None` for a missing or blank (`blank_player_ani`) motion.
+    motions: Vec<Option<MotionFile>>,
+    idle: Option<usize>,
+    moving: Option<usize>,
+    current: Option<usize>,
+    clock: f32,
+}
+
+/// Motion slots to play while standing and while walking, from the client's motion tables:
+/// a monster `.chr` has one slot per `MON_MOTION_TYPE` (`STAND1 = 1` is slot 0, `MOVE1 = 3` is
+/// slot 2); a player character uses `WALK = 7` (slot 6); an NPC has a single motion.
+fn default_motion_slots(package: &str) -> (Option<usize>, Option<usize>) {
+    match package.to_ascii_lowercase().as_str() {
+        "monster" => (Some(0), Some(2)),
+        "character" => (Some(0), Some(6)),
+        _ => (Some(0), None),
+    }
 }
 
 impl ActorModel {
-    fn load(ttb_path: &Path, package: &str, entry: &str, tile_size: f32) -> Result<Self, String> {
+    fn load(
+        ttb_path: &Path,
+        package: &str,
+        entry: &str,
+        tile_size: f32,
+        anim_variable: &str,
+    ) -> Result<Self, String> {
         let archive = open_data_package(ttb_path, package)?;
         let bytes = archive
             .read_entry(entry)
@@ -1733,12 +1831,126 @@ impl ActorModel {
             dds: vec![archive.clone()],
             tif: vec![archive],
         };
-        let model = Self::from_bytes(&bytes, &packages, tile_size)?;
+        let mut model = Self::from_bytes(&bytes, &packages, tile_size, true)?;
+        let (idle, moving) = motion_slots_override(package, anim_variable);
+        model.attach_motions(&packages.dds[0], entry, idle, moving);
         eprintln!(
-            "loaded actor {package}/{entry}: {} triangles",
-            model.vertices.len() / 3
+            "loaded actor {package}/{entry}: {} triangles{}",
+            model.vertices.len() / 3,
+            model
+                .rig
+                .as_ref()
+                .map(|rig| format!(
+                    ", {} motions (idle {:?}, moving {:?})",
+                    rig.motions.iter().flatten().count(),
+                    rig.idle,
+                    rig.moving
+                ))
+                .unwrap_or_default()
         );
         Ok(model)
+    }
+
+    /// Loads the model's `.chr` manifest and the motions it lists from the same package.
+    fn attach_motions(
+        &mut self,
+        archive: &PakArchive,
+        entry: &str,
+        idle: Option<usize>,
+        moving: Option<usize>,
+    ) {
+        let Some(rig) = &mut self.rig else {
+            return;
+        };
+        let stem = entry.rsplit_once('.').map_or(entry, |(stem, _)| stem);
+        let names = archive
+            .read_entry(&format!("{stem}.chr"))
+            .ok()
+            .and_then(|bytes| ChrManifest::parse(&bytes).ok())
+            .map_or_else(|| vec![format!("{stem}.anm")], |manifest| manifest.motions);
+        rig.motions = names
+            .iter()
+            .map(|name| {
+                let bytes = archive.read_entry(name).ok()?;
+                MotionFile::parse(&bytes)
+                    .ok()
+                    .filter(|motion| motion.records.iter().any(|record| record.has_tracks()))
+            })
+            .collect();
+        let available = |slot: Option<usize>| {
+            slot.filter(|slot| rig.motions.get(*slot).is_some_and(Option::is_some))
+        };
+        rig.idle = available(idle);
+        rig.moving = available(moving);
+    }
+
+    /// Advances the playing motion and re-poses every vertex.
+    fn animate(&mut self, delta: f32, moving: bool) {
+        let Self { vertices, rig, .. } = self;
+        let Some(rig) = rig else {
+            return;
+        };
+        let wanted = if moving {
+            rig.moving.or(rig.idle)
+        } else {
+            rig.idle
+        };
+        if wanted != rig.current {
+            rig.current = wanted;
+            rig.clock = 0.0;
+        }
+        let Some(Some(motion)) = rig.current.and_then(|slot| rig.motions.get(slot)) else {
+            return;
+        };
+        rig.clock += delta;
+        let tracks = rig.skeleton.tracks_for(motion);
+        let pose = rig.skeleton.pose(&tracks, motion.frame_at(rig.clock));
+        // `inverse bind * posed world` moves a point from the bind pose to the posed one.
+        let moves: Vec<_> = (0..pose.len())
+            .map(|node| rig.skeleton.rigid_matrix(node, &pose))
+            .collect();
+
+        let posed: Vec<PosedMesh> = rig
+            .meshes
+            .iter()
+            .map(|mesh| {
+                let mut positions = Vec::with_capacity(mesh.rest_positions.len());
+                let mut normals = Vec::with_capacity(mesh.rest_positions.len());
+                for (index, (rest, rest_normal)) in mesh
+                    .rest_positions
+                    .iter()
+                    .zip(&mesh.rest_normals)
+                    .enumerate()
+                {
+                    let (position, normal) = match mesh.influences.as_ref().map(|all| &all[index]) {
+                        Some(list) if !list.is_empty() => {
+                            let (mut position, mut normal) = ([0.0_f32; 3], [0.0_f32; 3]);
+                            for (node, weight) in list {
+                                let p = transform_point(&moves[*node], rest.to_array());
+                                let n = transform_vector(&moves[*node], rest_normal.to_array());
+                                for axis in 0..3 {
+                                    position[axis] += weight * p[axis];
+                                    normal[axis] += weight * n[axis];
+                                }
+                            }
+                            (position, normal)
+                        }
+                        _ => (
+                            transform_point(&moves[mesh.node], rest.to_array()),
+                            transform_vector(&moves[mesh.node], rest_normal.to_array()),
+                        ),
+                    };
+                    positions.push((Vec3::from_array(position) * rig.scale).to_array());
+                    normals.push(Vec3::from_array(normal).normalize_or(Vec3::Y).to_array());
+                }
+                (positions, normals)
+            })
+            .collect();
+        for (vertex, (mesh, index)) in vertices.iter_mut().zip(&rig.corners) {
+            let (positions, normals) = &posed[*mesh as usize];
+            vertex.position = positions[*index as usize];
+            vertex.normal = normals[*index as usize];
+        }
     }
 
     /// Builds the model from `.MOD` bytes, resolving its textures from `packages`.
@@ -1746,6 +1958,7 @@ impl ActorModel {
         bytes: &[u8],
         packages: &TexturePackages,
         tile_size: f32,
+        with_rig: bool,
     ) -> Result<Self, String> {
         let model = ModelFile::parse(bytes).map_err(|error| error.to_string())?;
         let names: Vec<String> = model
@@ -1756,11 +1969,15 @@ impl ActorModel {
         let textures = MapTextures::from_names(&names, packages);
 
         let scale = 1.0 / tile_size;
+        let skeleton = with_rig.then(|| Skeleton::new(&model));
         let mut vertices = Vec::new();
+        let mut corner_sources: Vec<(u32, u32)> = Vec::new();
+        let mut rig_meshes: Vec<RigMesh> = Vec::new();
         for mesh in &model.meshes {
             let Some(geometry) = &mesh.geometry else {
                 continue;
             };
+            let mesh_slot = rig_meshes.len() as u32;
             let points: Vec<Vec3> = geometry
                 .positions
                 .iter()
@@ -1777,6 +1994,35 @@ impl ActorModel {
                 normals[a] += normal;
                 normals[b] += normal;
                 normals[c] += normal;
+            }
+            if let Some(skeleton) = &skeleton {
+                let influences = geometry.skin.as_ref().map(|skin| {
+                    skin.influences
+                        .iter()
+                        .map(|list| {
+                            let total: f32 = list.iter().map(|item| item.weight).sum();
+                            list.iter()
+                                .filter_map(|item| {
+                                    let node = skeleton.index_of_id(item.bone_id)?;
+                                    (total > 1e-6).then_some((node, item.weight / total))
+                                })
+                                .collect()
+                        })
+                        .collect()
+                });
+                rig_meshes.push(RigMesh {
+                    node: skeleton.index_of_id(mesh.id).unwrap_or(0),
+                    rest_positions: geometry
+                        .positions
+                        .iter()
+                        .map(|position| Vec3::from_array(*position))
+                        .collect(),
+                    rest_normals: normals
+                        .iter()
+                        .map(|normal| normal.normalize_or(Vec3::Y))
+                        .collect(),
+                    influences,
+                });
             }
             for group in &geometry.face_groups {
                 // The group's `material` is a selector, not an index (see the assets README).
@@ -1799,6 +2045,7 @@ impl ActorModel {
                         continue;
                     }
                     for corner in corners {
+                        corner_sources.push((mesh_slot, corner as u32));
                         let uv = geometry
                             .texture_coordinates
                             .get(corner)
@@ -1821,7 +2068,22 @@ impl ActorModel {
         if vertices.is_empty() {
             return Err("the model has no decodable mesh".to_owned());
         }
-        Ok(Self { vertices, textures })
+        let rig = skeleton.map(|skeleton| Rig {
+            skeleton,
+            meshes: rig_meshes,
+            corners: corner_sources,
+            scale,
+            motions: Vec::new(),
+            idle: None,
+            moving: None,
+            current: None,
+            clock: 0.0,
+        });
+        Ok(Self {
+            vertices,
+            textures,
+            rig,
+        })
     }
 }
 
@@ -1829,7 +2091,18 @@ impl ActorModel {
 struct PropBatch {
     vertices: Vec<Vertex>,
     textures: MapTextures,
+    /// Set for animated `.CHR` props (fire, flags, machinery): the posed model and where it stands.
+    animated: Option<AnimatedProp>,
 }
+
+struct AnimatedProp {
+    model: ActorModel,
+    instances: Vec<MapObject>,
+}
+
+/// Animated props are re-posed and re-uploaded every frame, so only batches up to this many
+/// vertices (all instances together) are animated; bigger ones stay in the bind pose.
+const MAX_ANIMATED_PROP_VERTICES: usize = 60_000;
 
 /// Direction of the `GX_OBJECT` rotation. The script angle is a Direct3D (left-handed) rotation
 /// about Y; the world is drawn with the raw coordinates, so glam's right-handed rotation needs
@@ -1889,21 +2162,50 @@ fn load_props(ttb_path: &Path, map: &TileMap) -> Vec<PropBatch> {
             unresolved += instances.len();
             continue;
         };
-        let model = match ActorModel::from_bytes(&bytes, &packages, tile_size) {
+        let is_chr = resource.ends_with(".chr");
+        let model = match ActorModel::from_bytes(&bytes, &packages, tile_size, is_chr) {
             Ok(model) => model,
             Err(_) => {
                 broken += instances.len();
                 continue;
             }
         };
-        let mut vertices = Vec::with_capacity(model.vertices.len() * instances.len());
+        let mut model = model;
+        let total = model.vertices.len() * instances.len();
+        if is_chr && total <= MAX_ANIMATED_PROP_VERTICES {
+            // Play the first real motion of the manifest, looping.
+            // `attach_motions` reads `<stem>.chr`, which is the resource itself.
+            model.attach_motions(&archive, resource, Some(0), Some(0));
+            let has_motion = model
+                .rig
+                .as_ref()
+                .is_some_and(|rig| rig.motions.iter().flatten().next().is_some());
+            if has_motion && let Some(rig) = &mut model.rig {
+                rig.idle = rig.motions.iter().position(Option::is_some);
+                rig.moving = rig.idle;
+            } else {
+                model.rig = None;
+            }
+        } else {
+            model.rig = None;
+        }
+        let mut vertices = Vec::with_capacity(total);
         for object in instances {
             placed += 1;
             append_instance(&mut vertices, &model.vertices, object, map);
         }
+        let animated = model.rig.is_some().then(|| AnimatedProp {
+            instances: instances.iter().map(|object| (*object).clone()).collect(),
+            model: ActorModel {
+                vertices: model.vertices.clone(),
+                textures: MapTextures::default(),
+                rig: model.rig.take(),
+            },
+        });
         batches.push(PropBatch {
             vertices,
             textures: model.textures,
+            animated,
         });
     }
     eprintln!(

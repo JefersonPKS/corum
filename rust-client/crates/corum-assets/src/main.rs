@@ -5,6 +5,7 @@ use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::MapScript;
 use corum_assets::model::ModelFile;
 use corum_assets::motion::MotionFile;
+use corum_assets::pose::{Skeleton, transform_point};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
 use corum_assets::vcl::VertexColors;
@@ -43,6 +44,7 @@ fn run() -> Result<(), String> {
         "map-info" if arguments.len() == 2 => map_info(&arguments[1]),
         "stm-info" if arguments.len() == 2 => stm_info(&arguments[1]),
         "vcl-info" if arguments.len() == 3 => vcl_info(&arguments[1], &arguments[2]),
+        "pose-check" if arguments.len() == 3 => pose_check(&arguments[1], &arguments[2]),
         "lm-info" if arguments.len() == 3 => lm_info(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
@@ -119,6 +121,136 @@ fn lm_info(lm_path: &str, stm_path: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Poses a model with a motion and reports how well the pieces agree: tracks matched, how far
+/// the frame-0 pose is from the bind pose, and how well the skin reproduces the mesh.
+fn pose_check(model_path: &str, motion_path: &str) -> Result<(), String> {
+    let model = ModelFile::parse(&fs::read(model_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let motion = MotionFile::parse(&fs::read(motion_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let skeleton = Skeleton::new(&model);
+    let tracks = skeleton.tracks_for(&motion);
+    let animated = tracks.iter().filter(|track| track.is_some()).count();
+    println!(
+        "nodes: {} ({} bones), animated by the motion: {animated}",
+        skeleton.node_count(),
+        model.bones.len()
+    );
+    println!(
+        "motion: {} frames at {} fps ({:.2} s)",
+        motion.frame_count(),
+        motion.frame_speed,
+        motion.duration_seconds()
+    );
+
+    // 1. With no tracks the pose must be the bind pose, node by node and through the skin.
+    let bind = skeleton.pose(&vec![None; skeleton.node_count()], 0.0);
+    let (nodes_error, node_name) = largest_node_difference(&model, &skeleton, &bind);
+    let (skinned, vertices, skin_error) = skin_difference(&model, &skeleton, &bind);
+    println!("bind pose (no tracks): largest node difference {nodes_error:.4} ({node_name})");
+    println!(
+        "skin at the bind pose: {skinned} skinned meshes, {vertices} vertices, largest difference vs the stored positions {skin_error:.3}"
+    );
+
+    // 2. The first frame of a motion is a pose of its own (an idle is not the bind pose), so it
+    //    is only reported: how far the animated skeleton moves away from the bind pose.
+    let first = skeleton.pose(&tracks, motion.first_frame as f32);
+    let (moved, moved_name) = largest_node_difference(&model, &skeleton, &first);
+    println!(
+        "first frame of the motion: largest node movement from the bind pose {moved:.1} ({moved_name})"
+    );
+
+    // 3. Bones are rigid: the distance from a node to its parent must not change at any frame.
+    let mut worst_length = (0.0_f32, String::new(), 0_u32);
+    for frame in (0..motion.frame_count()).step_by(5) {
+        let posed = skeleton.pose(&tracks, motion.first_frame as f32 + frame as f32);
+        for (index, node) in model.nodes.iter().enumerate() {
+            let Some(parent) = skeleton.index_of_id(node.parent_id) else {
+                continue;
+            };
+            if parent == index {
+                continue;
+            }
+            let distance = |world: &[corum_assets::model::Matrix]| {
+                (0..3)
+                    .map(|axis| (world[index][3][axis] - world[parent][3][axis]).powi(2))
+                    .sum::<f32>()
+                    .sqrt()
+            };
+            let change = (distance(&posed) - distance(skeleton.bind_world())).abs();
+            if change > worst_length.0 {
+                worst_length = (change, node.name.clone(), frame);
+            }
+        }
+    }
+    println!(
+        "bone lengths over the motion: largest change {:.3} ({} at frame {})",
+        worst_length.0, worst_length.1, worst_length.2
+    );
+    Ok(())
+}
+
+fn largest_node_difference(
+    model: &ModelFile,
+    skeleton: &Skeleton,
+    pose: &[corum_assets::model::Matrix],
+) -> (f32, String) {
+    let mut worst = (0.0_f32, String::new());
+    for (index, world) in pose.iter().enumerate() {
+        let bind = skeleton.bind_world()[index];
+        let error = (0..3)
+            .map(|axis| (world[3][axis] - bind[3][axis]).abs())
+            .fold(0.0_f32, f32::max);
+        if error > worst.0 {
+            worst = (error, model.nodes[index].name.clone());
+        }
+    }
+    worst
+}
+
+/// Skins every mesh with `pose` and compares with the stored positions:
+/// `(skinned meshes, vertices, largest difference)`.
+fn skin_difference(
+    model: &ModelFile,
+    skeleton: &Skeleton,
+    pose: &[corum_assets::model::Matrix],
+) -> (usize, usize, f32) {
+    let (mut skinned, mut vertices, mut worst) = (0_usize, 0_usize, 0.0_f32);
+    for mesh in &model.meshes {
+        let Some(geometry) = &mesh.geometry else {
+            continue;
+        };
+        let Some(skin) = &geometry.skin else {
+            continue;
+        };
+        skinned += 1;
+        for (index, influences) in skin.influences.iter().enumerate() {
+            let mut sum = [0.0_f32; 3];
+            let mut total = 0.0_f32;
+            for influence in influences {
+                let Some(bone) = skeleton.index_of_id(influence.bone_id) else {
+                    continue;
+                };
+                let point = transform_point(&pose[bone], influence.offset);
+                for axis in 0..3 {
+                    sum[axis] += influence.weight * point[axis];
+                }
+                total += influence.weight;
+            }
+            let expected = geometry.positions[index];
+            // Uninitialised memory (0xCDCDCDCD) in the file's own positions is not a skin error.
+            if total > 1e-6 && expected.iter().all(|value| value.abs() < 1.0e6) {
+                let error = (0..3)
+                    .map(|axis| (sum[axis] / total - expected[axis]).abs())
+                    .fold(0.0_f32, f32::max);
+                worst = worst.max(error);
+            }
+            vertices += 1;
+        }
+    }
+    (skinned, vertices, worst)
 }
 
 fn vcl_info(vcl_path: &str, stm_path: &str) -> Result<(), String> {
@@ -219,13 +351,16 @@ fn mod_info(path: &str) -> Result<(), String> {
             })
             .unwrap_or(0);
         println!(
-            "  {}: vertices={}, uv={}, seams={}, faces={}, exportable={}{}",
+            "  {}: vertices={}, uv={}, seams={}, faces={}, exportable={}, skinned={}{}",
             mesh.name,
             mesh.vertex_count,
             mesh.texture_vertex_count,
             mesh.seam_vertex_count,
             face_count,
             mesh.geometry.is_some(),
+            mesh.geometry
+                .as_ref()
+                .is_some_and(|geometry| geometry.skin.is_some()),
             mesh.geometry_issue
                 .as_ref()
                 .map(|issue| format!(", issue={issue}"))
@@ -347,6 +482,7 @@ fn usage() -> String {
         "  corum-assets map-info <scene.map>",
         "  corum-assets stm-info <scene.stm>",
         "  corum-assets vcl-info <scene.vcl> <scene.stm>",
+        "  corum-assets pose-check <model.mod> <motion.anm>",
         "  corum-assets lm-info <scene.lm> <scene.stm>",
     ]
     .join("\n")

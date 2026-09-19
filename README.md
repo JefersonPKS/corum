@@ -5,6 +5,12 @@
 
 目前存在的问题:公会战不能用，无任务系统，职业只有五个，
 
+## Cliente Rust e pacote standalone
+
+A integração incremental com o pacote local de cliente/servidores está documentada em
+[STANDALONE_MIGRATION.md](STANDALONE_MIGRATION.md). O primeiro utilitário Rust de rede é o
+`corum-login-probe`, que testa o LoginAgent sem carregar as DLLs do cliente legado.
+
 
 
 爱发电

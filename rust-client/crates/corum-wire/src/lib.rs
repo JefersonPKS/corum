@@ -20,6 +20,9 @@ pub const CMD_CREATE_CHARACTER_SUCCESS: u8 = 2;
 pub const CMD_CREATE_CHARACTER_FAIL: u8 = 4;
 pub const CMD_WORLD_USER_INFO: u8 = 5;
 pub const CMD_CHARACTER_SELECT_FAIL: u8 = 9;
+pub const CMD_CONNECT_WORLD_SERVER: u8 = 10;
+pub const CMD_WORLD_LOGIN: u8 = 11;
+pub const CMD_WORLD_LOGIN_FAIL: u8 = 12;
 
 pub const NATIONAL_CODE_KOREA: u8 = 0;
 pub const NATIONAL_CODE_JAPAN: u8 = 1;
@@ -466,6 +469,39 @@ pub struct CharacterSelectFailure {
     pub error_code: u8,
 }
 
+/// `ASTC_CONNECT_WORLD_SERVER` (21 bytes), sent by LoginAgent after the selected character is
+/// accepted by the WorldServer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectWorldServer {
+    pub ip: u32,
+    pub port: u16,
+    pub property_id: u32,
+    pub character_index: u32,
+    pub serial_code: u32,
+    pub event_flag: u8,
+}
+
+impl ConnectWorldServer {
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        header(bytes, STATUS_CHARACTER_SELECT, CMD_CONNECT_WORLD_SERVER)?;
+        if bytes.len() != 21 {
+            return Err(WireError::UnexpectedLength {
+                expected: "21".to_owned(),
+                actual: bytes.len(),
+            });
+        }
+        let mut offset = 2;
+        Ok(Self {
+            ip: read_u32(bytes, &mut offset)?,
+            port: read_u16(bytes, &mut offset)?,
+            property_id: read_u32(bytes, &mut offset)?,
+            character_index: read_u32(bytes, &mut offset)?,
+            serial_code: read_u32(bytes, &mut offset)?,
+            event_flag: bytes[offset],
+        })
+    }
+}
+
 impl CharacterSelectFailure {
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         header(bytes, STATUS_CHARACTER_SELECT, CMD_CHARACTER_SELECT_FAIL)?;
@@ -514,6 +550,40 @@ mod tests {
             name: "Aria".to_owned(),
         };
         assert_eq!(packet.encode().unwrap().len(), 28);
+    }
+
+    #[test]
+    fn connect_world_server_decodes_the_loginagent_handoff() {
+        let bytes = [
+            STATUS_CHARACTER_SELECT,
+            CMD_CONNECT_WORLD_SERVER,
+            127,
+            0,
+            0,
+            1,
+            0x71,
+            0x32,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x04,
+        ];
+        let packet = ConnectWorldServer::decode(&bytes).unwrap();
+        assert_eq!(packet.ip, 0x0100_007F);
+        assert_eq!(packet.port, 0x3271);
+        assert_eq!(packet.property_id, 1);
+        assert_eq!(packet.character_index, 2);
+        assert_eq!(packet.serial_code, 3);
+        assert_eq!(packet.event_flag, 4);
     }
 
     #[test]

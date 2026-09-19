@@ -63,12 +63,12 @@ Ordem sugerida: ~~B1 → B2 → B3 → B4~~ (feitos) → **B6 (sombra de persona
 
 Inventário **[confirmado]**: `Monster.pak` tem 189 modelos, 192 manifestos `.chr` e 1.086 animações; `Npc.pak` tem 22 modelos; `Character.pak` tem 905 modelos, 617 manifestos e 259 animações.
 
-Estado do formato: 53 de 1.197 malhas de `Character` são estáticas e já exportáveis. As demais precisam de remapeamento de costuras (vértices duplicados em UV/normal) e pesos de skinning.
+Estado do formato (2026-09-19): a geometria (posições, UVs, costuras e faces) já é decodificada em 93% das malhas de `Character`, 99% de `Monster` e `Map_chr` e 100% de `Npc` (`tools/survey_models.py`). Falta a pose (hierarquia de nós/ossos) e os pesos de skinning.
 
 | # | Tarefa | Notas | Aceite |
 |---|---|---|---|
-| C0 | **Mostrar malhas estáticas agora** | O `corum-viewer` já abre `.MOD` estáticos. **Medido:** só ~5% das malhas decodificam (338 de 7.051 em `Map_chr`, 22 de 1.219 em `Monster`, 0 em `Npc`); os modelos inteiros são armas, flores, árvores e placas `ALP`. Como nenhum monstro ou NPC está entre eles, o C0 sozinho não substitui o mob de teste: ele depende do C1 | Um modelo estático real no sandbox (uma árvore ou flor, por exemplo) |
-| C1 | **Decodificar costuras e pesos de skinning do `.MOD`** | É o maior risco gráfico. **Avanço (2026-09-19):** as "costuras" são `S` UVs extras, com `T + S = V` (confirmado no farol de `Map_chr.pak`, que é estático); o payload dele já está mapeado em blocos (ver README do `corum-assets`) e o que falta é o layout de faces e grupos (triângulos de `u32`?) e os pesos. Pistas antigas: F4 tem contagens separadas de vértices, vértices de textura e costuras. Estratégia: (1) achar modelos pequenos com poucos ossos e vértices; (2) verificar hipóteses de layout contra `sizeof` do registro (o total tem que fechar sem sobras); (3) se travar, desmontar o carregador de modelos nas DLLs `SS3D*` do cliente | Os 1.197 malhas de `Character` viram triângulos com posição e UV corretos |
+| C0 ✅ | **Mostrar modelos reais** | Feito no visualizador: com o layout de geometria decifrado, um monstro alado (`Monster_m00630`) e um NPC humanoide (`Npc_npc007`) já aparecem com forma e proporções reconhecíveis (sem textura e sem pose). Falta levá-los ao sandbox de mapa, no lugar das caixas | Um modelo real no sandbox, com textura |
+| C1 ✅ (geometria) | **Decodificar costuras e geometria do `.MOD`** | Feito: as "costuras" são `S` UVs extras (`T + S = V`), seguidos de `S` índices de origem, e os grupos de faces usam o cabeçalho do STM (28 bytes) com triângulos `u16` sem preenchimento. 93–100% das malhas decodificam (ver README do `corum-assets`). **Aberto:** ~150 malhas com layout diferente, o restante do payload (normais, registros por grupo) e os **pesos de skinning** | Cumprido para a geometria; pesos em C3/C4 |
 | C2 | Semântica das tracks do `.ANM` | **[hipótese]** `track_24` = rotação (quaternion), `track_20` = posição ou escala (3 floats), `track_36` = posição + quaternion; a quinta é morph por vértice. Confirmar animando um osso simples e comparando visualmente | Animação de idle reconhecível |
 | C3 | Esqueleto: hierarquia `F5` (ossos/nós) e pose de bind | Depende de C1 e C2. A matriz de pose vem do pivot e do pai de cada nó | Modelo na pose de bind sem deformação |
 | C4 | Skinning na GPU (até N ossos por vértice) | Buffer de matrizes por instância; começar com CPU se ajudar a depurar | Mob caminhando com o modelo correto |
@@ -86,10 +86,10 @@ Há três trilhas que quase não dependem uma da outra:
 | Trilha | Primeira entrega | Bloqueia |
 |---|---|---|
 | Mapa e luz (A + B) | B1 (VCL) e B2 (luzes) no sandbox | nada |
-| Formatos de modelo (C1–C3) | Decodificação de costuras/pesos em um modelo pequeno | mobs e personagem animados |
+| Formatos de modelo (C1–C3) | Geometria já decifrada; falta a pose, os pesos e a animação | mobs e personagem animados |
 | Dados de jogo (C5) e protocolo (Marcos 1–2 do plano) | Parser de CDB; login por CLI | integração com servidor |
 
-Recomendação: a iluminação assada está completa e validada em 196 mapas (B1–B4, A1, A2). Seguir com **C0** (modelo estático no sandbox) e **A4** (objetos posicionados, que usam a mesma carga de `.MOD`), e deixar **C1** como investigação contínua, já que ela decide o cronograma dos mobs e do personagem.
+Recomendação: a iluminação assada está completa (B1–B4, A1, A2) e a geometria dos modelos também (C0, C1). Seguir com **A4** (objetos posicionados nos mapas, agora com ~99% dos `.MOD` de `Map_chr`), com a **textura dos modelos** e com a **pose por hierarquia de nós** (C3), que é o que faz o personagem de várias peças sair inteiro.
 
 ## Riscos e decisões pendentes
 

@@ -68,27 +68,39 @@ No payload `F4`, foram confirmados:
 - posições e UVs no layout estático;
 - grupos de faces, material e índices dos triângulos.
 
-O exportador OBJ atual cobre malhas estáticas nas quais vértices e UVs têm correspondência direta e não existem costuras adicionais. No pacote `Character`, todos os 905 arquivos MOD passam pela leitura estrutural: são 1.197 malhas, das quais 53 já são diretamente exportáveis. As outras 1.144 precisam da tabela de remapeamento de costuras e dos pesos de skinning.
+### Geometria da malha (decifrada em 2026-09-19)
 
-#### Malhas com costura (investigação em andamento)
+Depois do cabeçalho de `0x174` bytes do payload `F4`, com `V` vértices, `T` UVs e `S` costuras (`V = T + S`):
 
-As malhas em que `texture_vertex_count ≠ vertex_count` (1.144 das 1.197 malhas de `Character`, e todas as de `Monster` e `Npc`) não são exclusivas de personagens animados: até um farol estático de `Map_chr.pak` (`lighthouse-blue`, sem ossos) usa esse layout. Só **~5% das malhas** decodificam hoje: 53 de 1.197 em `Character`, 338 de 7.051 em `Map_chr`, 22 de 1.219 em `Monster` e 0 de 45 em `Npc`; os modelos inteiros decodificáveis são armas (`w0743`), flores, árvores e placas (`ALP`).
-
-Medido no farol (payload da malha `F4` de 20.408 bytes; `V=515`, `T=249`, `S=266`, e `T + S = V`, a mesma relação `A + B = V` do cabeçalho do STM):
-
-| Trecho | Tamanho | Estado |
+| Trecho | Tamanho | Conteúdo |
 |---|---|---|
-| cabeçalho | `0x174` | conhecido |
-| posições | `V × 12` | conhecido |
-| UVs | `T × 8` | conhecido |
-| **UVs de costura** | `S × 8` | **[confirmado]** são pares `(u, v)` com a mesma faixa dos UVs normais; com eles há um UV por vértice, como no STM |
-| faces e grupos | 273 palavras (1.092 bytes) | **layout diferente do simples**: aparecem como índices inteiros pequenos (`25,24,26 · 27,39,28 · 39,27,29 …`), possivelmente triângulos de `u32`; o cabeçalho de grupo do parser simples (`material, faces, faces`) não bate (`faces ≠ texture faces`) |
-| registros por grupo | ~264 bytes (3 grupos: 12 floats + 7 inteiros cada) | não interpretado |
-| bloco de floats | 2.040 bytes (= 170 × 12) | provável normais por face **[hipótese]** |
-| bloco de floats | `V × 12` bytes | provável normais por vértice **[hipótese]** |
-| rabicho | 52 bytes | não interpretado |
+| posições | `V × 12` | `[f32; 3]` por vértice |
+| UVs | `T × 8` | UVs dos vértices "regulares" |
+| **UVs de costura** | `S × 8` | UVs dos vértices duplicados ao longo de costuras de textura. Com os `T` anteriores há **um UV por vértice** (`MeshGeometry::texture_coordinates`) |
+| **fontes das costuras** | `S × 4` | `u32` por vértice de costura: índice `< T` do vértice que ele duplica (`MeshGeometry::seam_sources`). Os pesos de skinning são guardados só para os `T` primeiros, então é por aqui que a costura herda os pesos **[hipótese]** |
+| grupos de faces | variável, **sem contagem** | grupos consecutivos, lidos enquanto o padrão vale |
+| resto | variável | ainda não decodificado (ver abaixo) |
 
-Ainda não há pesos de skinning identificados; esses modelos com ossos parecem tê-los em outro trecho. O caminho é decifrar a região de faces e grupos deste modelo (é estático e pequeno, então serve de oráculo) e só depois olhar personagens.
+Um grupo tem o **mesmo cabeçalho do STM**: 28 bytes `material, x, faces, faces, 0, ?, 0`, seguidos de `faces` triângulos com três `u16` cada, **sem preenchimento** (o alinhamento a 4 bytes foi testado em ~2.100 malhas e a leitura sem padding é igual ou melhor em todas). `material` indexa a tabela de materiais do modelo; o significado de `x` é desconhecido.
+
+**Como foi descoberto:** a relação `T + S = V` apareceu num farol estático de `Map_chr.pak` (`lighthouse-blue`). O mapa de blocos do payload (2.040 bytes de floats = 170 × 12, `V × 12` de floats, 3 registros por grupo) e a regra de que o prefixo depois dos UVs de costura tem exatamente `S` palavras vieram da varredura de ~2.100 malhas; a leitura dos grupos foi validada no `Object01` (16 vértices), onde os materiais 9, 8, 7 e 6 e os triângulos `(5,9,10),(10,11,5)` aparecem exatamente como esperado. Um parser antigo assumia "contagem de grupos + cabeçalho de 24 bytes" e só cobria 5% das malhas: a "contagem" era, na verdade, o primeiro campo de um cabeçalho de grupo.
+
+**Resultado (`tools/survey_models.py`, contando registros `F4`):**
+
+| Pacote | Malhas decodificadas | Modelos completos |
+|---|---:|---:|
+| `Character` | 1.117 de 1.197 (93%) | 831 de 905 |
+| `Map_chr` | 7.000 de 7.051 (99%) | 363 de 378 |
+| `Monster` | 1.202 de 1.219 (99%) | 176 de 189 |
+| `Npc` | 45 de 45 (100%) | 22 de 22 |
+
+Antes eram 53, 338, 22 e 0. Confirmado na tela: um monstro alado (`Monster_m00630`) e um NPC humanoide (`Npc_npc007`) saem com forma e proporções reconhecíveis.
+
+**Ainda não decodificado:**
+
+- ~80 malhas de `Character`, ~50 de `Map_chr` e ~17 de `Monster` (erros do tipo "campo truncado" ou "contagem irracional" no meio do payload; layout de grupo ou vértices diferente, a investigar com `tools/survey_models.py`);
+- o restante do payload de cada malha: 3 registros por grupo (12 valores + 7 inteiros), um bloco de floats de tamanho `faces × 12` (provável normais por face) e outro de `V × 12` (provável normais por vértice) **[hipótese]**;
+- pesos de skinning e a ligação de cada malha a um osso: os modelos são desenhados hoje **sem pose**, cada malha em suas coordenadas locais. Personagens com várias peças (ex.: `Character_pm1277_000`) saem como peças sobrepostas até os nós `F5` (ossos) e o `pivot`/`parent_index` de cada malha serem aplicados.
 
 ### ANM versão 1
 

@@ -90,11 +90,11 @@ O primeiro subconjunto de `.mod` e `.anm` já está implementado:
 - os 905 MOD do pacote `Character` passam pela leitura estrutural;
 - materiais, malhas `F4`, ossos `F5` e registros especiais `F1` são delimitados sem usar as DLLs antigas;
 - o modelo mínimo `dfymiss.mod` foi exportado para OBJ com 4 vértices, 4 UVs e 2 triângulos;
-- 53 de 1.197 malhas de `Character` já usam o layout estático diretamente exportável;
+- 1.117 de 1.197 malhas de `Character` (e 99% das de `Monster` e `Map_chr`, 100% das de `Npc`) já são decodificadas, depois de descoberto que as "costuras" são UVs extras e que os grupos de faces usam o cabeçalho do STM (antes eram 53);
 - os 197 ANM de `Effect` e 259 ANM de `Character` passam pelo parser;
 - três tracks de keyframe, de 24, 20 e 36 bytes, foram confirmadas em 3.875 registros sem morph.
 
-O maior risco gráfico agora está concentrado no remapeamento de costuras, pesos de skinning e track de morph. Depois disso, os dados poderão ser convertidos para glTF e carregados por um motor Rust.
+O maior risco gráfico agora está concentrado nos pesos de skinning, na pose dos ossos e na track de morph. Depois disso, os dados poderão ser convertidos para glTF e carregados por um motor Rust.
 
 ## Achados principais
 

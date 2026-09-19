@@ -141,7 +141,9 @@ O passo a passo (com ordem, critérios de aceite e riscos) está em [`docs/VISUA
 - normais por vértice do `.STM` (hoje a normal é a da face);
 - fundo/céu e névoa (hoje é uma cor sólida) e materiais de água/transparência.
 
-Mobs e NPCs do cliente usam, em sua maioria, o trecho ainda não documentado do
-formato `.MOD` que liga vértices às costuras e aos ossos. Para exibi-los
-corretamente, a próxima etapa é decodificar esse skinning, combinar o manifesto
-`.CHR` com a animação `.ANM` e carregar a textura indicada pelo material.
+Os modelos `.MOD` de personagens, monstros e NPCs já são decodificados em 93 a 100% das
+malhas (ver `corum-assets/README.md`), mas ainda sem textura e **sem pose**: cada malha
+aparece nas suas coordenadas locais, então modelos de uma peça (monstro alado, NPC humanoide)
+saem com a forma certa e personagens de várias peças saem sobrepostos. A próxima etapa é
+aplicar a hierarquia de nós (`pivot`, `parent_index`, ossos `F5`), carregar a textura do
+material e combinar o manifesto `.CHR` com a animação `.ANM`.

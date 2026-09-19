@@ -52,8 +52,14 @@ pub struct ModelRecordSummary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MeshGeometry {
     pub positions: Vec<[f32; 3]>,
+    /// One UV per vertex. For seam-split meshes this is the `T` regular UVs followed by the
+    /// `S` seam UVs (`T + S` = vertex count).
     pub texture_coordinates: Vec<[f32; 2]>,
     pub face_groups: Vec<FaceGroup>,
+    /// Seam-split meshes only: for each seam vertex (vertex `T + i`), the index `< T` of the
+    /// vertex it duplicates. Skin weights are stored for the first `T` vertices, so this is
+    /// how a seam vertex inherits them. Empty for meshes without seams.
+    pub seam_sources: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,15 +293,21 @@ fn parse_mesh(bytes: &[u8], absolute: usize, flags: u32) -> Result<ModelMesh, Mo
     ];
 
     let (geometry, geometry_issue) =
-        if vertex_count == texture_vertex_count && seam_vertex_count == 0 {
-            match parse_simple_geometry(bytes, absolute, vertex_count, texture_vertex_count) {
+        if vertex_count == texture_vertex_count.saturating_add(seam_vertex_count) {
+            match parse_geometry(
+                bytes,
+                absolute,
+                vertex_count,
+                texture_vertex_count,
+                seam_vertex_count,
+            ) {
                 Ok(geometry) => (Some(geometry), None),
                 Err(failure) => (None, Some(failure.to_string())),
             }
         } else {
             (
                 None,
-                Some("skinned/seam-split geometry layout is not decoded yet".to_owned()),
+                Some("vertex, texture and seam counts do not add up".to_owned()),
             )
         };
 
@@ -312,27 +324,31 @@ fn parse_mesh(bytes: &[u8], absolute: usize, flags: u32) -> Result<ModelMesh, Mo
     })
 }
 
-fn parse_simple_geometry(
+/// Mesh geometry. `T` UVs, then `S` more UVs for vertices duplicated along texture seams
+/// (`T + S = V`; `S = 0` for meshes without seams), then `S` `u32` seam sources, then face
+/// groups with no leading count.
+///
+/// Payload layout after the `0x174` header: positions (`V * 12`), UVs (`T * 8`), seam UVs
+/// (`S * 8`), seam sources (`S * 4`), groups. A group is 28 bytes, `material, x, faces, faces,
+/// 0, ?, 0` (the same header the STM uses), followed by `faces` triangles of three `u16`
+/// indices, packed with no padding. Groups are read until the pattern stops holding; the rest
+/// of the payload (per-face and per-vertex float blocks, and skin data) is not decoded yet.
+fn parse_geometry(
     bytes: &[u8],
     absolute: usize,
     vertex_count: u32,
     texture_vertex_count: u32,
+    seam_vertex_count: u32,
 ) -> Result<MeshGeometry, ModelError> {
-    let vertex_count = count(vertex_count, absolute + MESH_COUNTS_OFFSET)?;
-    let texture_vertex_count = count(texture_vertex_count, absolute + MESH_COUNTS_OFFSET + 8)?;
-    let positions_size = checked_mul(vertex_count, 12, absolute + POSITIONS_OFFSET)?;
-    let uv_offset = checked_add(
-        POSITIONS_OFFSET,
-        positions_size,
-        absolute + POSITIONS_OFFSET,
-    )?;
-    let uv_size = checked_mul(texture_vertex_count, 8, absolute + uv_offset)?;
-    let mut cursor = checked_add(uv_offset, uv_size, absolute + uv_offset)?;
-    require_local(bytes, absolute, POSITIONS_OFFSET, positions_size)?;
-    require_local(bytes, absolute, uv_offset, uv_size)?;
+    const GROUP_HEADER_SIZE: usize = 28;
+    let vertices = count(vertex_count, absolute + MESH_COUNTS_OFFSET)?;
+    let regular_uvs = count(texture_vertex_count, absolute + MESH_COUNTS_OFFSET + 8)?;
+    let seams = count(seam_vertex_count, absolute + MESH_COUNTS_OFFSET + 12)?;
 
-    let mut positions = Vec::with_capacity(vertex_count);
-    for index in 0..vertex_count {
+    let positions_size = checked_mul(vertices, 12, absolute + POSITIONS_OFFSET)?;
+    require_local(bytes, absolute, POSITIONS_OFFSET, positions_size)?;
+    let mut positions = Vec::with_capacity(vertices);
+    for index in 0..vertices {
         let offset = POSITIONS_OFFSET + index * 12;
         positions.push([
             f32_at_local(bytes, absolute, offset)?,
@@ -341,57 +357,91 @@ fn parse_simple_geometry(
         ]);
     }
 
-    let mut texture_coordinates = Vec::with_capacity(texture_vertex_count);
-    for index in 0..texture_vertex_count {
-        let offset = uv_offset + index * 8;
+    // `T` regular UVs followed by `S` seam UVs are contiguous: one UV per vertex.
+    let uv_start = POSITIONS_OFFSET + positions_size;
+    let uv_size = checked_mul(vertices, 8, absolute + uv_start)?;
+    require_local(bytes, absolute, uv_start, uv_size)?;
+    let mut texture_coordinates = Vec::with_capacity(vertices);
+    for index in 0..vertices {
+        let offset = uv_start + index * 8;
         texture_coordinates.push([
             f32_at_local(bytes, absolute, offset)?,
             f32_at_local(bytes, absolute, offset + 4)?,
         ]);
     }
+    debug_assert_eq!(regular_uvs + seams, vertices);
 
-    let face_group_count = count(u32_at_local(bytes, absolute, cursor)?, absolute + cursor)?;
-    cursor = checked_add(cursor, 4, absolute + cursor)?;
-    let mut face_groups = Vec::with_capacity(face_group_count);
-    for _ in 0..face_group_count {
-        require_local(bytes, absolute, cursor, 24)?;
-        let material_index = u32_at_local(bytes, absolute, cursor)?;
-        let face_count = count(
-            u32_at_local(bytes, absolute, cursor + 4)?,
-            absolute + cursor + 4,
-        )?;
-        let texture_face_count = count(
-            u32_at_local(bytes, absolute, cursor + 8)?,
-            absolute + cursor + 8,
-        )?;
-        if face_count != texture_face_count {
+    let sources_start = uv_start + uv_size;
+    let sources_size = checked_mul(seams, 4, absolute + sources_start)?;
+    require_local(bytes, absolute, sources_start, sources_size)?;
+    let mut seam_sources = Vec::with_capacity(seams);
+    for index in 0..seams {
+        let source = u32_at_local(bytes, absolute, sources_start + index * 4)?;
+        if usize::try_from(source).is_ok_and(|source| source >= regular_uvs) {
             return Err(error(
-                absolute + cursor + 8,
-                "separate position/texture face lists are not supported yet",
+                absolute + sources_start + index * 4,
+                "seam source points past the regular vertices",
             ));
         }
-        cursor = checked_add(cursor, 24, absolute + cursor)?;
+        seam_sources.push(source);
+    }
+
+    let mut cursor = sources_start + sources_size;
+    let mut face_groups = Vec::new();
+    while cursor + GROUP_HEADER_SIZE <= bytes.len() {
+        let material_index = u32_at_local(bytes, absolute, cursor)?;
+        let face_count = u32_at_local(bytes, absolute, cursor + 8)?;
+        let repeated = u32_at_local(bytes, absolute, cursor + 12)?;
+        let (before, after) = (
+            u32_at_local(bytes, absolute, cursor + 16)?,
+            u32_at_local(bytes, absolute, cursor + 24)?,
+        );
+        if face_count == 0 || face_count != repeated || before != 0 || after != 0 {
+            break;
+        }
+        let face_count = count(face_count, absolute + cursor + 8)?;
         let index_bytes = checked_mul(face_count, 6, absolute + cursor)?;
-        require_local(bytes, absolute, cursor, index_bytes)?;
+        let indices_start = cursor + GROUP_HEADER_SIZE;
+        if indices_start
+            .checked_add(index_bytes)
+            .is_none_or(|end| end > bytes.len())
+        {
+            break;
+        }
         let mut faces = Vec::with_capacity(face_count);
-        for _ in 0..face_count {
-            faces.push([
-                u16_at_local(bytes, absolute, cursor)?,
-                u16_at_local(bytes, absolute, cursor + 2)?,
-                u16_at_local(bytes, absolute, cursor + 4)?,
-            ]);
-            cursor += 6;
+        for face in 0..face_count {
+            let offset = indices_start + face * 6;
+            let triangle = [
+                u16_at_local(bytes, absolute, offset)?,
+                u16_at_local(bytes, absolute, offset + 2)?,
+                u16_at_local(bytes, absolute, offset + 4)?,
+            ];
+            if triangle.iter().any(|index| usize::from(*index) >= vertices) {
+                break;
+            }
+            faces.push(triangle);
+        }
+        if faces.len() != face_count {
+            break;
         }
         face_groups.push(FaceGroup {
             material_index,
             faces,
         });
+        cursor = indices_start + index_bytes;
+    }
+    if face_groups.is_empty() {
+        return Err(error(
+            absolute + cursor,
+            "no face group found after the seam table",
+        ));
     }
 
     Ok(MeshGeometry {
         positions,
         texture_coordinates,
         face_groups,
+        seam_sources,
     })
 }
 
@@ -511,6 +561,96 @@ fn error(offset: usize, message: impl Into<String>) -> ModelError {
     ModelError {
         offset,
         message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn put(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// A quad split along a texture seam: 4 vertices, 2 regular UVs and 2 seam UVs.
+    #[test]
+    fn decodes_a_seam_split_quad() {
+        let (vertices, regular, seams) = (4_usize, 2_usize, 2_usize);
+        let mut bytes = vec![0_u8; POSITIONS_OFFSET];
+        put(&mut bytes, MESH_COUNTS_OFFSET, vertices as u32);
+        put(&mut bytes, MESH_COUNTS_OFFSET + 8, regular as u32);
+        put(&mut bytes, MESH_COUNTS_OFFSET + 12, seams as u32);
+        for index in 0..vertices {
+            for component in [index as f32, 0.0, 1.0] {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for index in 0..vertices {
+            for component in [index as f32 * 0.25, 0.5] {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for source in [1_u32, 0] {
+            bytes.extend_from_slice(&source.to_le_bytes());
+        }
+        // group: material 3, x 5, two faces, repeated, zeros
+        for value in [3_u32, 5, 2, 2, 0, 0, 0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in [0_u16, 1, 2, 2, 3, 0] {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        // trailing data that is not a group must be ignored
+        bytes.extend_from_slice(&[0xAB; 20]);
+
+        let mesh = parse_geometry(&bytes, 0, vertices as u32, regular as u32, seams as u32)
+            .expect("seam-split quad should decode");
+        assert_eq!(mesh.positions.len(), 4);
+        assert_eq!(mesh.texture_coordinates.len(), 4);
+        assert_eq!(mesh.texture_coordinates[3], [0.75, 0.5]);
+        assert_eq!(mesh.seam_sources, vec![1, 0]);
+        assert_eq!(mesh.face_groups.len(), 1);
+        assert_eq!(mesh.face_groups[0].material_index, 3);
+        assert_eq!(mesh.face_groups[0].faces, vec![[0, 1, 2], [2, 3, 0]]);
+    }
+
+    /// The same layout with no seams (`S = 0`), which the simple meshes use.
+    #[test]
+    fn decodes_a_mesh_without_seams() {
+        let mut bytes = vec![0_u8; POSITIONS_OFFSET];
+        put(&mut bytes, MESH_COUNTS_OFFSET, 3);
+        put(&mut bytes, MESH_COUNTS_OFFSET + 8, 3);
+        for index in 0..3_u32 {
+            for component in [index as f32, 1.0, 2.0] {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for _ in 0..3 {
+            for component in [0.5_f32, 0.5] {
+                bytes.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        for value in [2_u32, 0, 1, 1, 0, 0, 0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in [0_u16, 1, 2] {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        let mesh = parse_geometry(&bytes, 0, 3, 3, 0).expect("triangle should decode");
+        assert!(mesh.seam_sources.is_empty());
+        assert_eq!(mesh.face_groups[0].material_index, 2);
+        assert_eq!(mesh.face_groups[0].faces, vec![[0, 1, 2]]);
+    }
+
+    #[test]
+    fn rejects_seam_sources_that_point_at_seam_vertices() {
+        let mut bytes = vec![0_u8; POSITIONS_OFFSET + 2 * 12 + 2 * 8 + 4];
+        put(&mut bytes, MESH_COUNTS_OFFSET, 2);
+        put(&mut bytes, MESH_COUNTS_OFFSET + 8, 1);
+        put(&mut bytes, MESH_COUNTS_OFFSET + 12, 1);
+        let sources = POSITIONS_OFFSET + 2 * 12 + 2 * 8;
+        put(&mut bytes, sources, 1); // must be < regular UV count (1)
+        assert!(parse_geometry(&bytes, 0, 2, 1, 1).is_err());
     }
 }
 

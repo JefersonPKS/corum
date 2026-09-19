@@ -61,10 +61,11 @@ const BLACK_KEYED_FRACTION: f32 = 0.7;
 const ACTOR_YAW_OFFSET: f32 = 0.0;
 
 /// The turn that points a model's front along its movement. The sandbox turns an actor by the
-/// heading `atan2(x, z)`, which assumes the model looks toward +Z; the player models of the
-/// `Character` package look the other way (they walked backwards without this).
+/// heading `atan2(x, z)`, which assumes the model looks toward +Z; the models of the `Character`
+/// and `Monster` packages look the other way (they walked backwards without this). `Npc` models
+/// were not checked.
 fn facing_offset(package: &str) -> f32 {
-    if package.eq_ignore_ascii_case("character") {
+    if package.eq_ignore_ascii_case("character") || package.eq_ignore_ascii_case("monster") {
         std::f32::consts::PI
     } else {
         0.0
@@ -3419,7 +3420,7 @@ mod tests {
         // Sem esse giro os personagens andavam de costas (o "moonwalk").
         assert!((facing_offset("Character") - std::f32::consts::PI).abs() < 1e-6);
         assert!((facing_offset("character") - std::f32::consts::PI).abs() < 1e-6);
-        assert_eq!(facing_offset("Monster"), 0.0);
+        assert!((facing_offset("Monster") - std::f32::consts::PI).abs() < 1e-6);
         assert_eq!(facing_offset("Npc"), 0.0);
     }
 

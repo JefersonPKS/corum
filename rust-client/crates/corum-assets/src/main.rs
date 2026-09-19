@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use corum_assets::cdb::{self, Record};
 use corum_assets::chr::ChrManifest;
 use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::MapScript;
@@ -46,12 +47,133 @@ fn run() -> Result<(), String> {
         "vcl-info" if arguments.len() == 3 => vcl_info(&arguments[1], &arguments[2]),
         "pose-check" if arguments.len() == 3 => pose_check(&arguments[1], &arguments[2]),
         "lm-info" if arguments.len() == 3 => lm_info(&arguments[1], &arguments[2]),
+        "cdb-info" if arguments.len() == 2 => cdb_info(&arguments[1]),
+        "cdb-decode-all" if arguments.len() == 3 => cdb_decode_all(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             Ok(())
         }
         _ => Err(usage()),
     }
+}
+
+fn cdb_info(path: &str) -> Result<(), String> {
+    let decoded = cdb::decode(&fs::read(path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    println!("decoded_bytes: {}", decoded.len());
+    let name = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "level.cdb" => cdb_rows::<cdb::LevelExp>(&decoded, |row| {
+            format!("level={} exp={}", row.level, row.exp)
+        }),
+        "guardianlevel.cdb" | "guardianexp.cdb" => {
+            cdb_rows::<cdb::GuardianLevelExp>(&decoded, |row| format!("{row:?}"))
+        }
+        "npctable.cdb" => cdb_rows::<cdb::NpcTable>(&decoded, |row| {
+            format!(
+                "id={} name={} type={} says={}",
+                row.id,
+                row.name.lossy(),
+                row.kind,
+                row.messages[0].lossy()
+            )
+        }),
+        "cptable.cdb" => cdb_rows::<cdb::CpTable>(&decoded, |row| {
+            format!(
+                "id={} name={} class={} values={:?}",
+                row.id,
+                row.english_name.lossy(),
+                row.class,
+                row.values
+            )
+        }),
+        "itemstore.cdb" => cdb_rows::<cdb::ItemStore>(&decoded, |row| format!("{row:?}")),
+        "itemresource.cdb" => cdb_rows::<cdb::ItemResource>(&decoded, |row| {
+            format!(
+                "id={} icon={} model={} type={}",
+                row.id,
+                row.icon_file.lossy(),
+                row.model_file.lossy(),
+                row.resource_type
+            )
+        }),
+        "skillresource.cdb" => cdb_rows::<cdb::SkillResource>(&decoded, |row| {
+            format!(
+                "id={} icon={} kind={}",
+                row.id,
+                row.icon_file.lossy(),
+                row.kind
+            )
+        }),
+        "itemoption.cdb" => cdb_rows::<cdb::ItemOption>(&decoded, |row| {
+            format!(
+                "id={} count={} first={}",
+                row.id,
+                row.count,
+                row.options[0].lossy()
+            )
+        }),
+        "help.cdb" | "helpinfo.cdb" => cdb_rows::<cdb::HelpInfo>(&decoded, |row| {
+            format!(
+                "id={} text={} at=({},{})",
+                row.id,
+                row.text.lossy(),
+                row.left,
+                row.top
+            )
+        }),
+        "dungeonproductionitemminmax.cdb" => {
+            cdb_rows::<cdb::DungeonProductionItemRange>(&decoded, |row| format!("{row:?}"))
+        }
+        "baseclassinfo.cdb" => cdb_rows::<cdb::BaseClassInfo>(&decoded, |row| format!("{row:?}")),
+        _ => match cdb::TextPool::parse(&decoded) {
+            Ok(pool) => {
+                println!("kind: text pool, {} entries", pool.entries.len());
+                for entry in pool.entries.iter().take(10) {
+                    println!("  id={} text={}", entry.id, entry.text.lossy());
+                }
+                Ok(())
+            }
+            Err(_) => {
+                println!("kind: table without a typed parser yet");
+                Ok(())
+            }
+        },
+    }
+}
+
+fn cdb_rows<T: Record>(decoded: &[u8], show: impl Fn(&T) -> String) -> Result<(), String> {
+    let rows = cdb::parse_table::<T>(decoded).map_err(|error| error.to_string())?;
+    println!("kind: {} records of {} bytes", rows.len(), T::SIZE);
+    for row in rows.iter().take(10) {
+        println!("  {}", show(row));
+    }
+    Ok(())
+}
+
+fn cdb_decode_all(directory: &str, output: &str) -> Result<(), String> {
+    fs::create_dir_all(output).map_err(|error| error.to_string())?;
+    let mut done = 0;
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path
+            .extension()
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("cdb"))
+        {
+            continue;
+        }
+        let decoded = cdb::decode(&fs::read(&path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        fs::write(Path::new(output).join(format!("{name}.bin")), decoded)
+            .map_err(|error| error.to_string())?;
+        done += 1;
+    }
+    println!("decoded {done} tables into {output}");
+    Ok(())
 }
 
 fn ttb_info(path: &str) -> Result<(), String> {
@@ -479,6 +601,8 @@ fn usage() -> String {
         "  corum-assets mod-to-obj <model.mod> <output.obj>",
         "  corum-assets anm-info <motion.anm>",
         "  corum-assets ttb-info <map.ttb>",
+        "  corum-assets cdb-info <table.cdb>",
+        "  corum-assets cdb-decode-all <Data/Manager> <output-dir>",
         "  corum-assets map-info <scene.map>",
         "  corum-assets stm-info <scene.stm>",
         "  corum-assets vcl-info <scene.vcl> <scene.stm>",

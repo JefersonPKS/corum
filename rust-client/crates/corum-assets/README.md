@@ -322,6 +322,31 @@ Fica em aberto: o significado do primeiro campo e se o valor de fábrica do cinz
 
 Ainda não decifrado: o significado das chaves `track_36`; o que `x` (segundo campo do cabeçalho de grupo) e o campo de 5 bytes por vértice guardam além de "contagem e primeiro registro"; e o que faz algumas peças rígidas de armas (a maça do ogro) ficarem soltas: suspeita-se que a matriz de mundo guardada nas malhas não seja a do bind para todas **[hipótese]**.
 
+## Tabelas de jogo `.cdb` (`Data\Manager`, módulo `cdb`, 2026-09-19)
+
+- **Cifra [confirmado]:** `u32 tamanho` + `tamanho` bytes; o byte `i` é XOR com `(DECODE_KEY[i % 21] + 2) & 0xFF`. A chave `DECODE_KEY` está em `CorumOnlineProject/GameControl.h` em GBK e o parser a traz em bytes crus (`cdb::DECODE_KEY`). A rotina do cliente é `DecodeCDBData` (`GameControl.cpp`); o `CMessagePool::DecodeData4Text` (`MessagePool.cpp`) faz o mesmo para os textos.
+- **Depois de decifrado** o corpo é uma tabela de registros de tamanho fixo (`#pragma pack(1)`) **ou** um pool de textos.
+- **Como cada layout foi confirmado:** os tamanhos das structs do código-fonte (`struct.h`) dividem exatamente o corpo decifrado, e os primeiros registros fazem sentido. O teste `typed_tables_match_the_real_client_files` (rode com `CORUM_DATA` apontando para `Data`) confere as contagens abaixo.
+
+| Arquivo | Registro | Tamanho | Registros | Observação |
+|---|---|---|---|---|
+| `Level.cdb` | `LevelExp` | 9 | 200 | `u8 nível` + `u64 exp`; o `SLEVEL_EXP` do código-fonte (5 B) **não** bate com este arquivo |
+| `GuardianLevel.cdb`, `GuardianExp.cdb` | `GuardianLevelExp` | 5 | 200 | `u8` + `u32`, igual ao código-fonte (idênticos entre si) |
+| `ItemResource.cdb` | `ItemResource` | 89 | 3.058 | id → ícone (`weapon_icon01.tga`), modelo (`w0001`), tipo/animação |
+| `SkillResource.cdb` | `SkillResource` | 50 | 110 | id → ícone (`skill_icon1.tga`) |
+| `ItemOption.cdb` | `ItemOption` | 263 | 1.117 | até 4 linhas de texto por item |
+| `ItemStore.cdb` | `ItemStore` | 5 | 1.660 | item, tipo e mapa da loja |
+| `npctable.cdb` | `NpcTable` | 808 | 112 | id, nome, tipo, 3 falas de 256 B |
+| `CPTable.cdb` | `CpTable` | 249 | 31 | habilidades "CP": nomes, animações, sons, 5 pares (id, valor) |
+| `Help.cdb`, `HelpInfo.cdb` | `HelpInfo` | 73 | 732 | dica de ajuda + posição na tela |
+| `DungeonProductionItemMinMax.cdb` | `DungeonProductionItemRange` | 7 | 30 | faixa de ids de item por tipo de dungeon |
+| `BaseClassInfo.cdb` | `BaseClassInfo` | 20 | 6 | 5 × `i32` (aura, divino, invocação, chakra, magia), todos 100 |
+| `message.cdb`, `Cmd_Message.cdb`, `Emoticon.cdb`, `Filter_*Conv_Message.cdb` | `TextPool` | — | 1.823 / 17 / 40 / 22 | assinatura `Oops`; `u32 (ignorado)`, `Oops`, `contagem`, `tamanho_dos_textos`, `contagem × (id, posição)`, textos NUL-terminados; o cliente indexa pela posição |
+
+- **Idioma [confirmado]:** este cliente traz os textos em **inglês** (`message.cdb`: "Bank", "Occupied Dungeon"…); nomes de NPC como "Takion". Campos fixos são bytes crus (`FixedText`), com decodificação GBK só quando aparecer texto não ASCII.
+- **Ainda sem parser tipado** (a struct está no servidor ou não foi localizada): `ItemWeapon`, `ItemArmor`, `ItemConsumable`, `ItemSpecial`, `ItemSupplies`, `ItemMaterials`, `ItemEdition`, `Itemtalisman`, `ItemGuardian`, `ItemSetInfo`, `ItemAttrDefine`, `ItemUpgrade` (o cliente os recebe do servidor/`CBaseItem`), `Skill`/`SkillEffect` (`Skill.cdb` = `SkillEffect.cdb`, 202.176 B; começa com `u16 id`, `u16`…, nome de 32 B), `questlist` (226.502 B), `questnpc` (3.006 B), `questtitle` (2.052 B), `Interface*Info`, `KeyInfo`, `Hairshopoption`, `EventDungeonDescription`, `GroupInfo`, `Level`-like menores. Os cabeçalhos das tabelas de item começam com `u16 id` + nome (`Short Sword`, `Cap`, `Experience x2 (under lev 70)`).
+- **CLI:** `cdb-info <arquivo.cdb>` mostra o tipo/contagem e os 10 primeiros registros; `cdb-decode-all <Data\Manager> <saida>` grava os 55 corpos decifrados como `.bin`, para inspecionar as tabelas ainda sem parser.
+
 ## Uso
 
 ```powershell
@@ -342,6 +367,10 @@ cargo run -p corum-assets -- map-info "D:\Games\CorumOnline\Data\Map\1100.map"  
 cargo run -p corum-assets -- stm-info "D:\Games\CorumOnline\Data\Map\1100.stm"   # mostra unread_objects
 cargo run -p corum-assets -- vcl-info "D:\Games\CorumOnline\Data\Map\1100.vcl" "D:\Games\CorumOnline\Data\Map\1100.stm"
 cargo run -p corum-assets -- lm-info  "D:\Games\CorumOnline\Data\Map\1100.lm"  "D:\Games\CorumOnline\Data\Map\1100.stm"
+
+# tabelas de jogo (Manager)
+cargo run -p corum-assets -- cdb-info "D:\Games\CorumOnline\Data\Manager\npctable.cdb"
+cargo run -p corum-assets -- cdb-decode-all "D:\Games\CorumOnline\Data\Manager" .\target\verification\cdb
 ```
 
 Para conferir todos os mapas de uma vez (extrai os arquivos dos pacotes e roda `stm-info`, `vcl-info`, `lm-info` e `map-info` em cada um):

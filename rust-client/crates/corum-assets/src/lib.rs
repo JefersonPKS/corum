@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cdb;
 pub mod chr;
 pub mod dds;
 pub mod lightmap;

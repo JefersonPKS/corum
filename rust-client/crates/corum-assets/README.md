@@ -70,6 +70,26 @@ No payload `F4`, foram confirmados:
 
 O exportador OBJ atual cobre malhas estáticas nas quais vértices e UVs têm correspondência direta e não existem costuras adicionais. No pacote `Character`, todos os 905 arquivos MOD passam pela leitura estrutural: são 1.197 malhas, das quais 53 já são diretamente exportáveis. As outras 1.144 precisam da tabela de remapeamento de costuras e dos pesos de skinning.
 
+#### Malhas com costura (investigação em andamento)
+
+As malhas em que `texture_vertex_count ≠ vertex_count` (1.144 das 1.197 malhas de `Character`, e todas as de `Monster` e `Npc`) não são exclusivas de personagens animados: até um farol estático de `Map_chr.pak` (`lighthouse-blue`, sem ossos) usa esse layout. Só **~5% das malhas** decodificam hoje: 53 de 1.197 em `Character`, 338 de 7.051 em `Map_chr`, 22 de 1.219 em `Monster` e 0 de 45 em `Npc`; os modelos inteiros decodificáveis são armas (`w0743`), flores, árvores e placas (`ALP`).
+
+Medido no farol (payload da malha `F4` de 20.408 bytes; `V=515`, `T=249`, `S=266`, e `T + S = V`, a mesma relação `A + B = V` do cabeçalho do STM):
+
+| Trecho | Tamanho | Estado |
+|---|---|---|
+| cabeçalho | `0x174` | conhecido |
+| posições | `V × 12` | conhecido |
+| UVs | `T × 8` | conhecido |
+| **UVs de costura** | `S × 8` | **[confirmado]** são pares `(u, v)` com a mesma faixa dos UVs normais; com eles há um UV por vértice, como no STM |
+| faces e grupos | 273 palavras (1.092 bytes) | **layout diferente do simples**: aparecem como índices inteiros pequenos (`25,24,26 · 27,39,28 · 39,27,29 …`), possivelmente triângulos de `u32`; o cabeçalho de grupo do parser simples (`material, faces, faces`) não bate (`faces ≠ texture faces`) |
+| registros por grupo | ~264 bytes (3 grupos: 12 floats + 7 inteiros cada) | não interpretado |
+| bloco de floats | 2.040 bytes (= 170 × 12) | provável normais por face **[hipótese]** |
+| bloco de floats | `V × 12` bytes | provável normais por vértice **[hipótese]** |
+| rabicho | 52 bytes | não interpretado |
+
+Ainda não há pesos de skinning identificados; esses modelos com ossos parecem tê-los em outro trecho. O caminho é decifrar a região de faces e grupos deste modelo (é estático e pequeno, então serve de oráculo) e só depois olhar personagens.
+
 ### ANM versão 1
 
 O cabeçalho de 160 bytes contém versão, ticks por frame, primeiro/último frame, velocidade, duração e nome. Em seguida aparecem registros com tag `0x0000F000` e tamanho explícito.

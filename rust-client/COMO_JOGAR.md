@@ -17,6 +17,7 @@ interface original. Ainda **não** é o jogo completo (veja "O que ainda não ex
 | Tecla / mouse | O que faz |
 |---|---|
 | **clique esquerdo** no chão | o personagem anda até lá, contornando bloqueios (um marcador amarelo mostra o destino) |
+| **clique esquerdo no monstro** | o personagem corre até ele e ataca até derrubá-lo; o monstro revida (barras de vida sobre os dois) |
 | arrastar com o botão esquerdo | gira a câmera (a câmera acompanha o personagem) |
 | roda do mouse | aproxima / afasta |
 | setas | andam em linha reta; cancelam a rota do clique |
@@ -33,7 +34,7 @@ escaladas à janela), podem ser **arrastadas pela barra de título**, fechadas p
 
 ## O que ainda não existe
 
-- **Sem servidor, combate, monstros que reagem ou NPCs com fala.** Há um monstro patrulhando o mapa, só isso.
+- **Sem servidor nem NPCs com fala.** O combate é um **teste de brinquedo**: um monstro que patrulha, persegue, ataca e reaparece, com as animações originais de ataque, dano e morte, mas com vida e dano inventados (sem habilidades, itens caindo, experiência). Se o personagem cair, volta ao ponto inicial em 3 segundos.
 - **A interface é só a "moldura"**: as janelas mostram os desenhos originais (slots de equipamento, campos,
   botões), mas **não têm dados nem texto** (nome, PV, itens no inventário) e os botões ainda não fazem nada. A
   barra principal (PV/PM, atalhos, minimapa, chat) é desenhada por código no cliente original e ainda não foi
@@ -42,7 +43,7 @@ escaladas à janela), podem ser **arrastadas pela barra de título**, fechadas p
 - **Detalhes visuais conhecidos**: o elmo pode ficar escondido pelo cabelo; a empunhadura da arma não foi
   conferida com o original; algumas armas animadas (garras) aparecem incompletas; a janela de personagem mostra
   três botões soltos ("Cancel / Invitation / Close") que pertencem a outro diálogo.
-- Ainda não há som nem música.
+- Ainda não há som nem música. A câmera não tem colisão (uma pedra pode ficar na frente).
 
 ## Para desenvolvedores
 

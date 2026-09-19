@@ -45,6 +45,20 @@ pub fn record_schema() -> Schema {
 }
 
 impl Cdt {
+    /// The ten effect key frames (`ChrInfo::bEffectFrame`) of `animation` (0-based) and `motion`
+    /// (1-based, as `GetFrameInfo` takes them). The first one is the frame where a blow lands.
+    #[must_use]
+    pub fn effect_frames(&self, animation: u32, motion: u32) -> Option<[u8; 10]> {
+        if animation >= self.animation_count || motion == 0 || motion > self.motion_count {
+            return None;
+        }
+        let index = (animation * self.motion_count + motion - 1) as usize;
+        let record = self
+            .records
+            .get(index * RECORD_SIZE..index * RECORD_SIZE + 10)?;
+        record.try_into().ok()
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, CdtError> {
         let word = |offset: usize| {
             bytes
@@ -243,6 +257,23 @@ mod tests {
             assert_eq!(name, again_name);
             assert_eq!(&cdt.to_bytes(), bytes, "{name}");
         }
+    }
+
+    #[test]
+    fn effect_frames_are_indexed_by_animation_and_one_based_motion() {
+        // `file(2, 3, 5)`: o primeiro quadro de efeito do registro `i` é `5 + i`.
+        let cdt = Cdt::parse(&file(2, 3, 5)).unwrap();
+        assert_eq!(cdt.effect_frames(0, 1).unwrap()[0], 5);
+        assert_eq!(cdt.effect_frames(0, 3).unwrap()[0], 7);
+        assert_eq!(
+            cdt.effect_frames(1, 1).unwrap()[0],
+            8,
+            "animation 1 starts at record 3"
+        );
+        assert_eq!(cdt.effect_frames(1, 3).unwrap()[0], 10);
+        assert!(cdt.effect_frames(2, 1).is_none());
+        assert!(cdt.effect_frames(0, 0).is_none());
+        assert!(cdt.effect_frames(0, 4).is_none());
     }
 
     #[test]

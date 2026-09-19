@@ -9,7 +9,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
+use combat::{
+    HURT_SECONDS, MOB_ATTACK_COOLDOWN, MOB_CHASE_SPEED, MOB_DAMAGE, MOB_MAX_HP, MOB_REACH,
+    MOB_RESPAWN_SECONDS, MobMode, PLAYER_MAX_HP, PLAYER_REACH, PLAYER_RESPAWN_SECONDS, Vitals,
+    item_type, mob_decision, mob_motion, mob_slot, player_damage_roll, player_motion, player_slot,
+    ray_hits_sphere,
+};
 use corum_assets::PakArchive;
+use corum_assets::cdt::Cdt;
 use corum_assets::chr::ChrManifest;
 use corum_assets::dds::DecodedImage;
 use corum_assets::items::ItemCatalog;
@@ -33,6 +40,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+#[path = "../combat.rs"]
+mod combat;
 #[path = "../ui_gpu.rs"]
 mod ui_gpu;
 
@@ -74,6 +83,10 @@ fn facing_offset(package: &str) -> f32 {
 /// Pixels the cursor may move between press and release for the click to still be a move order
 /// (a longer drag orbits the camera instead).
 const CLICK_DRAG_LIMIT: f32 = 5.0;
+/// Height of the monster's body for picking it with a click, and where its life bar floats.
+const MOB_BODY_HEIGHT: f32 = 1.8;
+const PLAYER_BAR_HEIGHT: f32 = 2.05;
+const MOB_BAR_HEIGHT: f32 = 2.25;
 
 /// Interface window a key opens or closes. Play mode uses the original client's keys (`KeyConfig.ini`:
 /// `T` inventory, `A` character, `S` skills, `O` options); the development mode keeps `WASD` for
@@ -161,18 +174,36 @@ fn run() -> Result<(), String> {
     scene.props = load_props(&path, &scene.map);
     // `CORUM_PLAYER` names the body model directly; otherwise an outfit (`CORUM_CLASS`,
     // `CORUM_ARMOR`, ...) builds the character, and with neither the default NPC stands in.
+    let mut weapon_type = 0;
+    let mut player_cdt = None;
     match Outfit::from_env().filter(|_| env::var_os("CORUM_PLAYER").is_none()) {
         Some(outfit) => {
             let (body, parts) = outfit.build(&path, tile_size);
             scene.player_model = body;
             scene.attachments = parts;
+            weapon_type = item_type(outfit.right);
+            player_cdt = load_cdt(&path, &format!("pm{:02}000", outfit.class));
         }
         None => {
             scene.player_model = load_actor(&path, "CORUM_PLAYER", DEFAULT_PLAYER_MODEL, tile_size);
         }
     }
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
+    // The monster's own `.cdt` (key frames of its swing), named after its model.
+    let mob_spec = env::var("CORUM_MOB").unwrap_or_else(|_| DEFAULT_MOB_MODEL.to_owned());
+    let mob_stem = mob_spec
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|name| name.rsplit_once('.').map(|(stem, _)| stem))
+        .unwrap_or_default()
+        .to_owned();
+    let mob_cdt = load_cdt(&path, &mob_stem);
+    scene.setup_combat(weapon_type, player_cdt.as_ref(), mob_cdt.as_ref());
     scene.pending_ui = load_interface(&path);
+    // Debug: `CORUM_AUTOFIGHT=1` orders the attack on the monster right away (repeatable checks).
+    if env::var_os("CORUM_AUTOFIGHT").is_some() {
+        scene.attack_mob();
+    }
     // Debug: `CORUM_PLAYER_AT=x,z` starts the player at those map-script coordinates, to point
     // the camera at a specific spot in repeatable screenshots.
     if let Some([x, z]) = env::var("CORUM_PLAYER_AT").ok().and_then(|value| {
@@ -194,6 +225,16 @@ fn run() -> Result<(), String> {
     event_loop
         .run_app(&mut application)
         .map_err(|error| error.to_string())
+}
+
+/// `Data\\Cdt\\<stem>.cdt`: the key frames of each motion of a character or monster.
+fn load_cdt(ttb_path: &Path, stem: &str) -> Option<Cdt> {
+    data_directories(ttb_path)
+        .into_iter()
+        .find_map(|directory| {
+            let bytes = fs::read(directory.join("Cdt").join(format!("{stem}.cdt"))).ok()?;
+            Cdt::parse(&bytes).ok()
+        })
 }
 
 /// The original interface: its tables from `Data\Manager` and the images of the `UI` package.
@@ -391,7 +432,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         if game_mode() {
-            return "Corum Online (Rust) — clique: andar | T: inventário | A: personagem | S: habilidades | O: opções | Esc: fechar janela ou sair".to_owned();
+            return "Corum Online (Rust) — clique: andar ou atacar o monstro | T: inventário | A: personagem | S: habilidades | O: opções | Esc: fechar janela ou sair".to_owned();
         }
         format!(
             "Corum Map Viewer — {} — {} — clique: andar | Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
@@ -559,6 +600,67 @@ impl ApplicationHandler for SandboxApplication {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlayerState {
+    Free,
+    Attacking,
+    Hurt,
+    Dead,
+}
+
+/// Offline combat state (toy numbers, see `combat.rs`); the timings come from the motions.
+struct Fight {
+    player_life: Vitals,
+    player_state: PlayerState,
+    player_clock: f32,
+    player_start: Vec3,
+    /// Weapon type of the right hand (`id / 200 + 1`), which picks the character's motion set.
+    item_type: u16,
+    /// A click on the monster: keep walking to it and swinging until it falls.
+    attack_target: bool,
+    replan: f32,
+    blows: u32,
+    player_hit_done: bool,
+    player_attack_seconds: f32,
+    player_hit_seconds: f32,
+    player_hurt_seconds: f32,
+    mob_life: Vitals,
+    mob_mode: MobMode,
+    mob_clock: f32,
+    mob_spawn: Vec3,
+    mob_hit_done: bool,
+    mob_attack_seconds: f32,
+    mob_hit_seconds: f32,
+    mob_hurt_seconds: f32,
+}
+
+impl Fight {
+    fn new(player: Vec3, mob: Vec3) -> Self {
+        Self {
+            player_life: Vitals::full(PLAYER_MAX_HP),
+            player_state: PlayerState::Free,
+            player_clock: 0.0,
+            player_start: player,
+            item_type: 0,
+            attack_target: false,
+            replan: 0.0,
+            blows: 0,
+            player_hit_done: false,
+            player_attack_seconds: 0.9,
+            player_hit_seconds: 0.45,
+            player_hurt_seconds: HURT_SECONDS,
+            mob_life: Vitals::full(MOB_MAX_HP),
+            mob_mode: MobMode::Patrol,
+            mob_clock: 0.0,
+            mob_spawn: mob,
+            mob_hit_done: false,
+            mob_attack_seconds: 0.9,
+            mob_hit_seconds: 0.45,
+            mob_hurt_seconds: HURT_SECONDS,
+        }
+    }
+}
+
 struct SandboxScene {
     map: TileMap,
     map_vertices: Vec<Vertex>,
@@ -588,6 +690,9 @@ struct SandboxScene {
     moving: bool,
     /// Points still to walk to, in sandbox coordinates (the click-to-move route).
     route: Vec<Vec2>,
+    fight: Fight,
+    mob_moving: bool,
+    camera_yaw: f32,
     /// The original interface (windows and their images), handed to the renderer once.
     pending_ui: Option<(UiDesktop, Option<PakArchive>)>,
 }
@@ -602,7 +707,7 @@ impl SandboxScene {
     ) -> Result<Self, String> {
         let player = closest_walkable_to_center(&map)
             .ok_or_else(|| "TTB map has no walkable tile".to_owned())?;
-        let mob = farthest_walkable(&map, player).unwrap_or(player);
+        let mob = walkable_at_distance(&map, player, 7.0).unwrap_or(player);
         let (stm_vertices, stm_objects) = static_model
             .map(|model| build_stm_vertices(model, &map, textures, baked))
             .unwrap_or_default();
@@ -653,6 +758,9 @@ impl SandboxScene {
             elapsed: 0.0,
             moving: false,
             route: Vec::new(),
+            fight: Fight::new(player, mob),
+            mob_moving: false,
+            camera_yaw: 0.0,
             pending_ui: None,
         })
     }
@@ -677,28 +785,25 @@ impl SandboxScene {
 
     fn update(&mut self, delta: f32, camera_yaw: f32) {
         self.elapsed += delta;
-        let mut input = Vec2::new(
+        self.camera_yaw = camera_yaw;
+        let input = Vec2::new(
             f32::from(self.input.right) - f32::from(self.input.left),
             f32::from(self.input.forward) - f32::from(self.input.backward),
         );
-        let keyboard = input.length_squared() > 0.0;
-        if keyboard {
-            // Steering by hand cancels a click-to-move route.
-            self.route.clear();
-        }
-        self.moving = keyboard || !self.route.is_empty();
-        if !keyboard {
-            self.follow_route(delta);
-        }
-        if keyboard {
-            input = input.normalize();
+        let free = self.fight.player_state == PlayerState::Free;
+        let keyboard_direction = (input.length_squared() > 0.0 && free).then(|| {
+            let input = input.normalize();
             let forward = Vec3::new(-camera_yaw.sin(), 0.0, -camera_yaw.cos());
             let right = Vec3::new(forward.z, 0.0, -forward.x);
-            let direction = (right * input.x + forward * input.y).normalize_or_zero();
-            let speed = if self.input.run { 6.0 } else { 3.3 };
-            self.move_player(direction * speed * delta);
+            (right * input.x + forward * input.y).normalize_or_zero()
+        });
+        if keyboard_direction.is_some() {
+            // Steering by hand cancels a click-to-move route and a pursuit.
+            self.route.clear();
+            self.fight.attack_target = false;
         }
-        self.update_mob(delta);
+        self.update_player(delta, keyboard_direction);
+        self.update_mob_ai(delta);
         for batch in &mut self.props {
             let Some(animated) = &mut batch.animated else {
                 continue;
@@ -722,9 +827,339 @@ impl SandboxScene {
                 }
             }
         }
+        let mob_moving = self.mob_moving;
         if let Some(model) = &mut self.mob_model {
-            model.animate(delta, true);
+            model.animate(delta, mob_moving);
         }
+    }
+
+    /// Player state machine: free (walk, chase), swinging, reacting to a hit, or down.
+    fn update_player(&mut self, delta: f32, keyboard_direction: Option<Vec3>) {
+        self.moving = false;
+        match self.fight.player_state {
+            PlayerState::Dead => {
+                self.fight.player_clock += delta;
+                if self.fight.player_clock >= PLAYER_RESPAWN_SECONDS {
+                    self.respawn_player();
+                }
+            }
+            PlayerState::Hurt => {
+                self.fight.player_clock += delta;
+                if self.fight.player_clock >= self.fight.player_hurt_seconds {
+                    self.fight.player_state = PlayerState::Free;
+                }
+            }
+            PlayerState::Attacking => {
+                self.fight.player_clock += delta;
+                if !self.fight.player_hit_done
+                    && self.fight.player_clock >= self.fight.player_hit_seconds
+                {
+                    self.fight.player_hit_done = true;
+                    self.player_hits_mob();
+                }
+                if self.fight.player_clock >= self.fight.player_attack_seconds {
+                    self.fight.player_state = PlayerState::Free;
+                }
+            }
+            PlayerState::Free => {
+                if let Some(direction) = keyboard_direction {
+                    self.moving = true;
+                    let speed = if self.input.run { 6.0 } else { 3.3 };
+                    self.move_player(direction * speed * delta);
+                } else if self.fight.attack_target {
+                    self.chase_target(delta);
+                } else {
+                    self.moving = !self.route.is_empty();
+                    self.follow_route(delta);
+                }
+            }
+        }
+    }
+
+    /// Walks toward the clicked monster and swings once it is within reach.
+    fn chase_target(&mut self, delta: f32) {
+        if self.fight.mob_mode == MobMode::Dead {
+            self.fight.attack_target = false;
+            return;
+        }
+        let offset = Vec2::new(self.mob.x - self.player.x, self.mob.z - self.player.z);
+        if offset.length() <= PLAYER_REACH {
+            self.route.clear();
+            self.player_yaw = offset.x.atan2(offset.y) + ACTOR_YAW_OFFSET;
+            self.start_player_attack();
+            return;
+        }
+        self.fight.replan -= delta;
+        if self.route.is_empty() || self.fight.replan <= 0.0 {
+            self.walk_to(self.mob, false);
+            self.fight.replan = 0.4;
+            if self.route.is_empty() {
+                self.fight.attack_target = false;
+                return;
+            }
+        }
+        self.moving = !self.route.is_empty();
+        self.follow_route(delta);
+    }
+
+    fn start_player_attack(&mut self) {
+        self.fight.player_state = PlayerState::Attacking;
+        self.fight.player_clock = 0.0;
+        self.fight.player_hit_done = false;
+        let slot = player_slot(self.fight.item_type, player_motion::ATTACK1_1);
+        if let Some(model) = &mut self.player_model {
+            model.play_action(slot, false);
+        }
+    }
+
+    /// The blow lands (at the `.cdt` key frame of the swing): hurt the monster if it is in reach.
+    fn player_hits_mob(&mut self) {
+        let distance = Vec2::new(self.mob.x - self.player.x, self.mob.z - self.player.z).length();
+        if self.fight.mob_mode == MobMode::Dead || distance > PLAYER_REACH * 1.4 {
+            return;
+        }
+        let damage = player_damage_roll(self.fight.blows);
+        self.fight.blows += 1;
+        let killed = self.fight.mob_life.hurt(damage);
+        eprintln!(
+            "combat: you hit the monster for {damage} ({}/{})",
+            self.fight.mob_life.hp, self.fight.mob_life.max
+        );
+        if killed {
+            self.fight.mob_mode = MobMode::Dead;
+            self.fight.mob_clock = 0.0;
+            self.fight.attack_target = false;
+            let slot = mob_slot(mob_motion::DOWN);
+            if let Some(model) = &mut self.mob_model {
+                model.play_action(slot, true);
+            }
+            eprintln!("combat: the monster is down");
+        } else if self.fight.mob_mode != MobMode::Attack {
+            // A swing in progress is not interrupted (like the player's), so it can hit back.
+            self.fight.mob_mode = MobMode::Hurt;
+            self.fight.mob_clock = 0.0;
+            let slot = mob_slot(mob_motion::DEFENSEFAIL1);
+            if let Some(model) = &mut self.mob_model {
+                model.play_action(slot, false);
+            }
+        }
+    }
+
+    /// The monster's blow lands on the player.
+    fn hurt_player(&mut self, amount: i32) {
+        if self.fight.player_state == PlayerState::Dead {
+            return;
+        }
+        let killed = self.fight.player_life.hurt(amount);
+        eprintln!(
+            "combat: the monster hits you for {amount} ({}/{})",
+            self.fight.player_life.hp, self.fight.player_life.max
+        );
+        let item_type = self.fight.item_type;
+        if killed {
+            self.fight.player_state = PlayerState::Dead;
+            self.fight.player_clock = 0.0;
+            self.fight.attack_target = false;
+            self.route.clear();
+            if let Some(model) = &mut self.player_model {
+                model.play_action(player_slot(item_type, player_motion::DYING), true);
+            }
+            eprintln!("combat: you are down; back on your feet in a moment");
+        } else if self.fight.player_state == PlayerState::Free {
+            // A swing in progress is not interrupted, so the fight cannot be stun-locked.
+            self.fight.player_state = PlayerState::Hurt;
+            self.fight.player_clock = 0.0;
+            self.route.clear();
+            if let Some(model) = &mut self.player_model {
+                model.play_action(player_slot(item_type, player_motion::DEFENSEFAIL), false);
+            }
+        }
+    }
+
+    fn respawn_player(&mut self) {
+        self.player = self.fight.player_start;
+        self.fight.player_life = Vitals::full(PLAYER_MAX_HP);
+        self.fight.player_state = PlayerState::Free;
+        self.route.clear();
+        if let Some(model) = &mut self.player_model {
+            model.stop_action();
+        }
+        eprintln!("combat: you are back on your feet");
+    }
+
+    fn respawn_mob(&mut self) {
+        self.mob = self.fight.mob_spawn;
+        self.fight.mob_life = Vitals::full(MOB_MAX_HP);
+        self.fight.mob_mode = MobMode::Patrol;
+        if let Some(model) = &mut self.mob_model {
+            model.stop_action();
+        }
+        eprintln!("combat: a new monster appears");
+    }
+
+    /// Monster brain: patrol, wake up and chase, swing, react to a blow, lie down and come back.
+    fn update_mob_ai(&mut self, delta: f32) {
+        let to_player = Vec2::new(self.player.x - self.mob.x, self.player.z - self.mob.z);
+        let distance = to_player.length();
+        let player_alive = self.fight.player_state != PlayerState::Dead;
+        self.mob_moving = false;
+        match self.fight.mob_mode {
+            MobMode::Dead => {
+                self.fight.mob_clock += delta;
+                if self.fight.mob_clock >= MOB_RESPAWN_SECONDS {
+                    self.respawn_mob();
+                }
+            }
+            MobMode::Hurt => {
+                self.fight.mob_clock += delta;
+                if self.fight.mob_clock >= self.fight.mob_hurt_seconds {
+                    self.fight.mob_mode = MobMode::Chase;
+                }
+            }
+            mode => {
+                let next = mob_decision(mode, distance, player_alive);
+                if next != mode {
+                    self.fight.mob_mode = next;
+                    if next == MobMode::Attack {
+                        self.start_mob_attack();
+                    }
+                }
+                match self.fight.mob_mode {
+                    MobMode::Patrol => {
+                        self.mob_moving = true;
+                        self.update_mob(delta);
+                    }
+                    MobMode::Chase => {
+                        self.mob_moving = true;
+                        self.chase_player(to_player, delta);
+                    }
+                    MobMode::Attack => {
+                        if distance > 1e-3 {
+                            self.mob_yaw = to_player.x.atan2(to_player.y) + ACTOR_YAW_OFFSET;
+                        }
+                        self.fight.mob_clock += delta;
+                        if !self.fight.mob_hit_done
+                            && self.fight.mob_clock >= self.fight.mob_hit_seconds
+                        {
+                            self.fight.mob_hit_done = true;
+                            if distance <= MOB_REACH * 1.4 && player_alive {
+                                self.hurt_player(MOB_DAMAGE);
+                            }
+                        }
+                        if self.fight.mob_clock
+                            >= self.fight.mob_attack_seconds + MOB_ATTACK_COOLDOWN
+                        {
+                            self.start_mob_attack();
+                        }
+                    }
+                    MobMode::Hurt | MobMode::Dead => {}
+                }
+            }
+        }
+    }
+
+    fn start_mob_attack(&mut self) {
+        self.fight.mob_clock = 0.0;
+        self.fight.mob_hit_done = false;
+        let slot = mob_slot(mob_motion::ATTACK1);
+        if let Some(model) = &mut self.mob_model {
+            model.play_action(slot, false);
+        }
+    }
+
+    /// Runs at the player, sliding along walls like the player does.
+    fn chase_player(&mut self, to_player: Vec2, delta: f32) {
+        let Some(direction) = to_player.try_normalize() else {
+            return;
+        };
+        let step = direction * MOB_CHASE_SPEED * delta;
+        let along_x = Vec3::new(self.mob.x + step.x, 0.0, self.mob.z);
+        if self.can_stand(along_x, 0.24) {
+            self.mob.x = along_x.x;
+        }
+        let along_z = Vec3::new(self.mob.x, 0.0, self.mob.z + step.y);
+        if self.can_stand(along_z, 0.24) {
+            self.mob.z = along_z.z;
+        }
+        self.mob_yaw = direction.x.atan2(direction.y) + ACTOR_YAW_OFFSET;
+    }
+
+    /// Clicking the monster (a ray through its body) orders an attack.
+    fn mob_under_ray(&self, origin: Vec3, direction: Vec3) -> bool {
+        self.fight.mob_mode != MobMode::Dead
+            && ray_hits_sphere(
+                origin.to_array(),
+                direction.to_array(),
+                [self.mob.x, MOB_BODY_HEIGHT * 0.5, self.mob.z],
+                MOB_BODY_HEIGHT * 0.5,
+            )
+    }
+
+    fn attack_mob(&mut self) {
+        if self.fight.player_state == PlayerState::Dead || self.fight.mob_mode == MobMode::Dead {
+            return;
+        }
+        self.route.clear();
+        self.fight.attack_target = true;
+        self.fight.replan = 0.0;
+        eprintln!("combat: attacking the monster");
+    }
+
+    /// Wires the motions of the equipped weapon and the swing timings, from the `.chr` slots and the
+    /// `.cdt` key frames; without them a swing lands halfway through.
+    fn setup_combat(&mut self, item_type: u16, player_cdt: Option<&Cdt>, mob_cdt: Option<&Cdt>) {
+        self.fight.item_type = item_type;
+        if let Some(model) = &mut self.player_model {
+            model.set_stance(
+                player_slot(item_type, player_motion::STAND1),
+                player_slot(item_type, player_motion::WALK),
+            );
+            let attack = player_slot(item_type, player_motion::ATTACK1_1);
+            if let Some(length) = model.motion_duration(attack) {
+                self.fight.player_attack_seconds = length;
+                self.fight.player_hit_seconds = length * 0.5;
+                let frame = player_cdt
+                    .and_then(|cdt| {
+                        cdt.effect_frames(u32::from(item_type), u32::from(player_motion::ATTACK1_1))
+                    })
+                    .map(|frames| u32::from(frames[0]))
+                    .filter(|frame| *frame > 0);
+                if let Some(seconds) = frame.and_then(|f| model.motion_seconds_at_frame(attack, f))
+                {
+                    self.fight.player_hit_seconds = seconds.min(length);
+                }
+            }
+            if let Some(length) =
+                model.motion_duration(player_slot(item_type, player_motion::DEFENSEFAIL))
+            {
+                self.fight.player_hurt_seconds = length;
+            }
+        }
+        if let Some(model) = &mut self.mob_model {
+            let attack = mob_slot(mob_motion::ATTACK1);
+            if let Some(length) = model.motion_duration(attack) {
+                self.fight.mob_attack_seconds = length;
+                self.fight.mob_hit_seconds = length * 0.5;
+                let frame = mob_cdt
+                    .and_then(|cdt| cdt.effect_frames(0, u32::from(mob_motion::ATTACK1)))
+                    .map(|frames| u32::from(frames[0]))
+                    .filter(|frame| *frame > 0);
+                if let Some(seconds) = frame.and_then(|f| model.motion_seconds_at_frame(attack, f))
+                {
+                    self.fight.mob_hit_seconds = seconds.min(length);
+                }
+            }
+            if let Some(length) = model.motion_duration(mob_slot(mob_motion::DEFENSEFAIL1)) {
+                self.fight.mob_hurt_seconds = length;
+            }
+        }
+        eprintln!(
+            "combat: weapon type {item_type}; swing {:.2}s (hit at {:.2}s), monster swing {:.2}s (hit at {:.2}s)",
+            self.fight.player_attack_seconds,
+            self.fight.player_hit_seconds,
+            self.fight.mob_attack_seconds,
+            self.fight.mob_hit_seconds
+        );
     }
 
     /// Sandbox coordinates (tiles centred on the map) to map tile coordinates.
@@ -736,7 +1171,7 @@ impl SandboxScene {
     }
 
     /// Plans a route to `target` over the walkable tiles and starts walking it.
-    fn walk_to(&mut self, target: Vec3) {
+    fn walk_to(&mut self, target: Vec3, announce: bool) {
         let path = navigation::find_path(
             &self.map,
             self.to_tile_space(self.player),
@@ -745,12 +1180,14 @@ impl SandboxScene {
         );
         match path {
             Some(points) => {
-                eprintln!(
-                    "walk: {} waypoint(s) to tile ({:.1}, {:.1})",
-                    points.len(),
-                    points.last().map_or(0.0, |point| point[0]),
-                    points.last().map_or(0.0, |point| point[1])
-                );
+                if announce {
+                    eprintln!(
+                        "walk: {} waypoint(s) to tile ({:.1}, {:.1})",
+                        points.len(),
+                        points.last().map_or(0.0, |point| point[0]),
+                        points.last().map_or(0.0, |point| point[1])
+                    );
+                }
                 let half = Vec2::new(self.map.width as f32, self.map.height as f32) * 0.5;
                 self.route = points
                     .iter()
@@ -758,7 +1195,9 @@ impl SandboxScene {
                     .collect();
             }
             None => {
-                eprintln!("walk: no route to that spot");
+                if announce {
+                    eprintln!("walk: no route to that spot");
+                }
                 self.route.clear();
             }
         }
@@ -863,6 +1302,25 @@ impl SandboxScene {
             if self.player_model.is_none() {
                 add_humanoid(&mut vertices, self.player + Vec3::Y * bob);
             }
+            let right = Vec3::new(self.camera_yaw.cos(), 0.0, -self.camera_yaw.sin());
+            if self.fight.player_state != PlayerState::Dead {
+                add_life_bar(
+                    &mut vertices,
+                    self.player + Vec3::Y * PLAYER_BAR_HEIGHT,
+                    self.fight.player_life.fraction(),
+                    right,
+                    [0.25, 0.85, 0.3],
+                );
+            }
+            if self.fight.mob_mode != MobMode::Dead {
+                add_life_bar(
+                    &mut vertices,
+                    self.mob + Vec3::Y * MOB_BAR_HEIGHT,
+                    self.fight.mob_life.fraction(),
+                    right,
+                    [0.9, 0.15, 0.15],
+                );
+            }
             if let Some(destination) = self.route.last() {
                 add_pyramid(
                     &mut vertices,
@@ -921,7 +1379,7 @@ impl SandboxScene {
     }
 
     fn maximum_vertex_count(&self) -> usize {
-        self.stm_vertices.len() + self.map_vertices.len() + 200 + 64
+        self.stm_vertices.len() + self.map_vertices.len() + 200 + 128
     }
 
     fn select_object(&mut self, direction: isize) {
@@ -991,17 +1449,15 @@ fn closest_walkable_to_center(map: &TileMap) -> Option<Vec3> {
         .map(|(index, _)| tile_center(map, index))
 }
 
-fn farthest_walkable(map: &TileMap, from: Vec3) -> Option<Vec3> {
-    map.tiles
-        .iter()
-        .enumerate()
-        .filter(|(_, tile)| tile.is_walkable())
-        .max_by(|(left, _), (right, _)| {
-            tile_center(map, *left)
-                .distance_squared(from)
-                .total_cmp(&tile_center(map, *right).distance_squared(from))
+/// A walkable tile about `distance` tiles from `from`: the monster starts near enough to find.
+fn walkable_at_distance(map: &TileMap, from: Vec3, distance: f32) -> Option<Vec3> {
+    (0..map.tiles.len())
+        .filter(|index| map.tiles[*index].is_walkable())
+        .map(|index| tile_center(map, index))
+        .min_by(|a, b| {
+            let error = |point: &Vec3| ((*point - from).length() - distance).abs();
+            error(a).total_cmp(&error(b))
         })
-        .map(|(index, _)| tile_center(map, index))
 }
 
 fn tile_distance_squared(map: &TileMap, index: usize, point: Vec2) -> f32 {
@@ -1311,6 +1767,49 @@ fn add_pyramid(vertices: &mut Vec<Vertex>, center: Vec3, half: f32, height: f32,
     }
 }
 
+/// A flat life bar that faces the camera: dark back plate and a fill of `fraction` (0..1) of the width.
+fn add_life_bar(
+    vertices: &mut Vec<Vertex>,
+    anchor: Vec3,
+    fraction: f32,
+    right: Vec3,
+    fill: [f32; 3],
+) {
+    const WIDTH: f32 = 1.0;
+    const HEIGHT: f32 = 0.10;
+    let normal = right.cross(Vec3::Y);
+    let start = anchor - right * (WIDTH * 0.5);
+    let up = Vec3::Y * HEIGHT;
+    add_quad(
+        vertices,
+        [
+            start,
+            start + right * WIDTH,
+            start + right * WIDTH + up,
+            start + up,
+        ],
+        normal,
+        [0.08, 0.08, 0.08],
+    );
+    if fraction > 0.0 {
+        // The fill sits a hair in front of the plate and a little inside its border.
+        let lift = normal * 0.004;
+        let inset = right * 0.012 + Vec3::Y * 0.012;
+        let end = start + right * (WIDTH * fraction);
+        add_quad(
+            vertices,
+            [
+                start + inset + lift,
+                end - right * 0.012 + Vec3::Y * 0.012 + lift,
+                end - right * 0.012 + up - Vec3::Y * 0.012 + lift,
+                start + inset + up - Vec3::Y * 0.024 + lift,
+            ],
+            normal,
+            fill,
+        );
+    }
+}
+
 fn add_quad(vertices: &mut Vec<Vertex>, corners: [Vec3; 4], normal: Vec3, color: [f32; 3]) {
     for index in [0, 1, 2, 0, 2, 3] {
         vertices.push(Vertex::new(corners[index], normal, color));
@@ -1535,18 +2034,23 @@ impl Camera {
     }
 }
 
-/// Where the ray through `ndc` (normalised device coordinates, y up) meets the plane `y = ground`.
+/// The world ray (origin, unit direction) through `ndc` (normalised device coordinates, y up).
 /// The projection has Direct3D-style depth: 0 at the near plane, 1 at the far plane.
-fn unproject_to_ground(view_projection: [[f32; 4]; 4], ndc: Vec2, ground: f32) -> Option<Vec3> {
+fn unproject_ray(view_projection: [[f32; 4]; 4], ndc: Vec2) -> (Vec3, Vec3) {
     let inverse = Mat4::from_cols_array_2d(&view_projection).inverse();
     let near = inverse.project_point3(ndc.extend(0.0));
     let far = inverse.project_point3(ndc.extend(1.0));
-    let direction = far - near;
+    (near, (far - near).normalize_or_zero())
+}
+
+/// Where the ray through `ndc` meets the plane `y = ground`.
+fn unproject_to_ground(view_projection: [[f32; 4]; 4], ndc: Vec2, ground: f32) -> Option<Vec3> {
+    let (origin, direction) = unproject_ray(view_projection, ndc);
     if direction.y.abs() < 1e-6 {
         return None;
     }
-    let along = (ground - near.y) / direction.y;
-    (along > 0.0).then(|| near + direction * along)
+    let along = (ground - origin.y) / direction.y;
+    (along > 0.0).then(|| origin + direction * along)
 }
 
 struct Renderer {
@@ -1859,24 +2363,37 @@ impl Renderer {
         })
     }
 
-    /// Where the cursor's ray meets the ground plane (the player's height), in sandbox coordinates.
-    fn ground_under_cursor(&self) -> Option<Vec3> {
+    /// The cursor as normalised device coordinates (y up), or `None` before the window has a size.
+    fn cursor_ndc(&self) -> Option<Vec2> {
         let cursor = self.camera.last_cursor?;
         let (width, height) = (self.config.width as f32, self.config.height as f32);
-        if width < 1.0 || height < 1.0 {
-            return None;
-        }
-        let ndc = Vec2::new(
-            2.0 * cursor.x as f32 / width - 1.0,
-            1.0 - 2.0 * cursor.y as f32 / height,
-        );
-        let view_projection = self.camera.uniform(width / height).view_projection;
-        unproject_to_ground(view_projection, ndc, self.scene.player.y)
+        (width >= 1.0 && height >= 1.0).then(|| {
+            Vec2::new(
+                2.0 * cursor.x as f32 / width - 1.0,
+                1.0 - 2.0 * cursor.y as f32 / height,
+            )
+        })
     }
 
+    fn view_projection(&self) -> [[f32; 4]; 4] {
+        let (width, height) = (self.config.width as f32, self.config.height as f32);
+        self.camera.uniform(width / height.max(1.0)).view_projection
+    }
+
+    /// A click orders an attack on the monster under the cursor, or else a walk to the ground there.
     fn click_to_move(&mut self) {
-        if let Some(target) = self.ground_under_cursor() {
-            self.scene.walk_to(target);
+        let Some(ndc) = self.cursor_ndc() else {
+            return;
+        };
+        let view_projection = self.view_projection();
+        let (origin, direction) = unproject_ray(view_projection, ndc);
+        if self.scene.mob_under_ray(origin, direction) {
+            self.scene.attack_mob();
+            return;
+        }
+        self.scene.fight.attack_target = false;
+        if let Some(target) = unproject_to_ground(view_projection, ndc, self.scene.player.y) {
+            self.scene.walk_to(target, true);
         }
     }
 
@@ -2128,6 +2645,15 @@ struct Rig {
     moving: Option<usize>,
     current: Option<usize>,
     clock: f32,
+    /// A motion played once (an attack, a hit, falling down) that overrides idle and walking.
+    action: Option<Action>,
+    action_restart: bool,
+}
+
+struct Action {
+    slot: usize,
+    /// Stay on the last frame when it ends (lying down) instead of going back to idle.
+    hold: bool,
 }
 
 /// Motion slots to play while standing and while walking, from the client's motion tables:
@@ -2212,27 +2738,91 @@ impl ActorModel {
         rig.moving = available(moving);
     }
 
+    fn motion_at(&self, slot: usize) -> Option<&MotionFile> {
+        self.rig.as_ref()?.motions.get(slot)?.as_ref()
+    }
+
+    /// Length in seconds of the motion in `slot`, if it exists.
+    fn motion_duration(&self, slot: usize) -> Option<f32> {
+        self.motion_at(slot).map(MotionFile::duration_seconds)
+    }
+
+    /// Time at which the motion in `slot` reaches a `.cdt` frame number.
+    fn motion_seconds_at_frame(&self, slot: usize, frame: u32) -> Option<f32> {
+        self.motion_at(slot)
+            .map(|motion| motion.seconds_at_frame(frame))
+    }
+
+    /// Plays the motion in `slot` once from its start; `false` if the model has no such motion.
+    fn play_action(&mut self, slot: usize, hold: bool) -> bool {
+        if self.motion_at(slot).is_none() {
+            return false;
+        }
+        if let Some(rig) = &mut self.rig {
+            rig.action = Some(Action { slot, hold });
+            rig.action_restart = true;
+        }
+        true
+    }
+
+    fn stop_action(&mut self) {
+        if let Some(rig) = &mut self.rig {
+            rig.action = None;
+        }
+    }
+
+    /// Standing and walking motions, when the model has them (the weapon in hand changes the set).
+    fn set_stance(&mut self, idle: usize, moving: usize) {
+        let has = |model: &Self, slot: usize| model.motion_at(slot).is_some();
+        let (idle_ok, moving_ok) = (has(self, idle), has(self, moving));
+        if let Some(rig) = &mut self.rig {
+            if idle_ok {
+                rig.idle = Some(idle);
+            }
+            if moving_ok {
+                rig.moving = Some(moving);
+            }
+        }
+    }
+
     /// Advances the playing motion and re-poses every vertex.
     fn animate(&mut self, delta: f32, moving: bool) {
         let Self { vertices, rig, .. } = self;
         let Some(rig) = rig else {
             return;
         };
-        let wanted = if moving {
+        let wanted = if let Some(action) = &rig.action {
+            Some(action.slot)
+        } else if moving {
             rig.moving.or(rig.idle)
         } else {
             rig.idle
         };
-        if wanted != rig.current {
+        if wanted != rig.current || rig.action_restart {
             rig.current = wanted;
             rig.clock = 0.0;
+            rig.action_restart = false;
         }
         let Some(Some(motion)) = rig.current.and_then(|slot| rig.motions.get(slot)) else {
             return;
         };
         rig.clock += delta;
+        let once = rig.action.is_some();
+        let frame = if once {
+            motion.frame_clamped_at(rig.clock)
+        } else {
+            motion.frame_at(rig.clock)
+        };
+        // A motion played once that has run its course hands the actor back to idle or walking.
+        if rig
+            .action
+            .as_ref()
+            .is_some_and(|action| !action.hold && rig.clock >= motion.duration_seconds())
+        {
+            rig.action = None;
+        }
         let tracks = rig.skeleton.tracks_for(motion);
-        let pose = rig.skeleton.pose(&tracks, motion.frame_at(rig.clock));
+        let pose = rig.skeleton.pose(&tracks, frame);
         rig.pose.clone_from(&pose);
         // `inverse bind * posed world` moves a point from the bind pose to the posed one.
         let moves: Vec<_> = (0..pose.len())
@@ -2408,6 +2998,8 @@ impl ActorModel {
             moving: None,
             current: None,
             clock: 0.0,
+            action: None,
+            action_restart: false,
         });
         Ok(Self {
             facing: 0.0,

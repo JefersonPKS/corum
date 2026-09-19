@@ -49,6 +49,21 @@ impl MotionFile {
         let frames = self.frame_count() as f32;
         (seconds * self.frame_speed.max(1) as f32).rem_euclid(frames) + self.first_frame as f32
     }
+
+    /// Frame position for a motion played **once**: it stops on the last frame instead of looping
+    /// (attacks, being hit, dying).
+    #[must_use]
+    pub fn frame_clamped_at(&self, seconds: f32) -> f32 {
+        let last = (self.frame_count() - 1) as f32;
+        (seconds * self.frame_speed.max(1) as f32).clamp(0.0, last) + self.first_frame as f32
+    }
+
+    /// Time in seconds at which the motion reaches `frame` (a frame number as the `.cdt` tables give
+    /// them); frames before the first one give 0.
+    #[must_use]
+    pub fn seconds_at_frame(&self, frame: u32) -> f32 {
+        frame.saturating_sub(self.first_frame) as f32 / self.frame_speed.max(1) as f32
+    }
 }
 
 impl MotionRecord {
@@ -405,6 +420,43 @@ fn error(offset: usize, message: impl Into<String>) -> MotionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn motion(first: u32, last: u32, speed: u32) -> MotionFile {
+        MotionFile {
+            version: 1,
+            ticks_per_frame: 160,
+            first_frame: first,
+            last_frame: last,
+            frame_speed: speed,
+            field_14: 0,
+            field_18: 0,
+            duration_ticks: 0,
+            name: String::new(),
+            records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_motion_played_once_stops_on_its_last_frame() {
+        let attack = motion(10, 29, 20); // 20 quadros a 20 por segundo: 1 s
+        assert_eq!(attack.frame_clamped_at(0.0), 10.0);
+        assert_eq!(attack.frame_clamped_at(0.5), 20.0);
+        assert_eq!(attack.frame_clamped_at(1.0), 29.0);
+        assert_eq!(
+            attack.frame_clamped_at(9.0),
+            29.0,
+            "holds instead of looping"
+        );
+        assert_eq!(attack.frame_at(1.5), 20.0, "the looping variant wraps");
+    }
+
+    #[test]
+    fn frame_numbers_convert_to_seconds() {
+        let attack = motion(10, 29, 20);
+        assert_eq!(attack.seconds_at_frame(20), 0.5);
+        assert_eq!(attack.seconds_at_frame(10), 0.0);
+        assert_eq!(attack.seconds_at_frame(3), 0.0, "before the first frame");
+    }
 
     #[test]
     fn parses_an_empty_motion_record() {

@@ -203,6 +203,19 @@ olhe para o lado errado). Verificados na tela: `npc007`, `npc012`, `m00010` e `m
 - **Frente dos modelos [confirmado na tela]:** o sandbox gira o ator pelo rumo do movimento, supondo que a frente do modelo é +Z. Os modelos dos pacotes `Character` (jogador e suas peças) e `Monster` olham para o lado contrário e andavam de costas; `facing_offset` gira 180° os modelos desses pacotes (a cabeça, o elmo, a arma e o escudo acompanham o corpo). Os modelos `Npc` ficam com deslocamento 0 e **a frente deles não foi verificada**.
 - **Limites conhecidos:** a janela `CHAR` mostra três botões soltos ("Cancel / Invitation / Close") que pertencem a um diálogo de partida (não há como saber pelas tabelas que estão escondidos); os sprites são desenhados opacos onde a imagem não tem alfa (TGA de 24 bits), sem cor-chave.
 
+### Combate offline e animações de ação (2026-09-19)
+
+Um combate de brinquedo para testar as animações originais. **Os números de vida, dano e alcance são inventados [hipótese]** (`combat.rs`); os **números de movimento, o tipo de arma e os quadros em que o golpe acerta são do cliente original**.
+
+- **Clique no monstro** = atacar: o personagem corre até ficar ao alcance (rota recalculada a cada 0,4 s), vira para ele e golpeia em sequência até derrubá-lo; clicar no chão, usar as setas ou morrer cancelam. A escolha é um raio do cursor contra uma esfera no corpo do monstro (`ray_hits_sphere`).
+- **Movimentos do jogador [confirmado no código do cliente]:** o `.chr` de um personagem tem 9 tipos de arma × 50 movimentos e o cliente toca `SetAction(tipo × 50 + movimento)`; o tipo é `id_da_arma / 200 + 1` (`ITEM_DISTRIBUTE`; 0 sem arma). Com a espada (tipo 1): parado `STAND1` = movimento 4 (slot 53), andar `WALK` = 7 (56), golpe `ATTACK1_1` = 9 (slot 58, `pa01009.anm`), reação `DEFENSEFAIL` = 30 e morte `DYING` = 33. Antes o sandbox usava sempre o conjunto "sem arma".
+- **Movimentos do monstro:** `MON_MOTION_TYPE` menos 1 é o slot do `.chr`: parado 1, andar 3, golpe `ATTACK1` 5, reação `DEFENSEFAIL1` 12, morte `DOWN` 15 (mantida no último quadro).
+- **Quando o golpe acerta [confirmado]:** no quadro `bEffectFrame[0]` do `.cdt` do movimento (`Cdt::effect_frames`). Espada: quadro 12 a 25 quadros por segundo = 0,48 s de um golpe de 0,92 s; monstro `m00010`: quadro 16 = 0,64 s. Sem o `.cdt`, o golpe acerta na metade do movimento.
+- **Regras de brinquedo:** jogador 100 de vida, golpe de 8 a 12; monstro 60 de vida, golpe de 6 a cada 0,92 s + 0,7 s de pausa; alcance 1,5 (jogador) e 1,4 (monstro); o monstro passa a perseguir a 5 tiles e desiste a 10. Um golpe em andamento **não é interrompido** (nem o do jogador nem o do monstro), para não travar a luta. O monstro cai e reaparece em 4 s no ponto de partida; o jogador cai e volta ao ponto inicial em 3 s com a vida cheia.
+- **Barras de vida:** verde sobre o jogador e vermelha sobre o monstro, viradas para a câmera. A câmera ainda não tem colisão: uma pedra do cenário pode ficar entre ela e o personagem.
+- **Depuração:** `CORUM_AUTOFIGHT=1` já manda atacar o monstro ao abrir (o log mostra `combat: ...` a cada golpe). O monstro agora nasce a ~7 tiles do jogador.
+- **Código:** regras puras e testadas em `src/combat.rs`; a máquina de estados (jogador livre/golpeando/ferido/caído, monstro em patrulha/perseguição/ataque/ferido/caído) e as ações de uma animação só (`play_action`, `set_stance`; `MotionFile::frame_clamped_at`) estão no sandbox.
+
 ### Verificação visual automatizada
 
 `tools/capture-window.ps1` abre um binário, mexe na câmera (roda, arrasto, teclas) e salva a janela em PNG. Se a janela não ficar ativa, o script não envia nenhuma entrada e não captura. Exemplo, depois de `cargo build -p corum-viewer`:

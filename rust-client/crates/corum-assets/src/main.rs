@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 
 use corum_assets::chr::ChrManifest;
+use corum_assets::map_script::MapScript;
 use corum_assets::model::ModelFile;
 use corum_assets::motion::MotionFile;
+use corum_assets::stm::StaticModelFile;
+use corum_assets::ttb::TileMap;
 use corum_assets::{PakArchive, PakError};
 use std::env;
 use std::fs;
@@ -34,12 +37,83 @@ fn run() -> Result<(), String> {
         "mod-info" if arguments.len() == 2 => mod_info(&arguments[1]),
         "mod-to-obj" if arguments.len() == 3 => mod_to_obj(&arguments[1], &arguments[2]),
         "anm-info" if arguments.len() == 2 => anm_info(&arguments[1]),
+        "ttb-info" if arguments.len() == 2 => ttb_info(&arguments[1]),
+        "map-info" if arguments.len() == 2 => map_info(&arguments[1]),
+        "stm-info" if arguments.len() == 2 => stm_info(&arguments[1]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             Ok(())
         }
         _ => Err(usage()),
     }
+}
+
+fn ttb_info(path: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let map = TileMap::parse(&bytes).map_err(|error| error.to_string())?;
+    let walkable = map.tiles.iter().filter(|tile| tile.is_walkable()).count();
+    println!("dimensions: {}x{}", map.width, map.height);
+    println!("tile_size: {}", map.tile_size);
+    println!("declared_objects: {}", map.declared_object_count);
+    println!("walkable_tiles: {walkable}/{}", map.tiles.len());
+    println!("declared_sections: {:?}", map.declared_section_count);
+    println!("trailing_bytes: {}", map.trailing_bytes);
+    Ok(())
+}
+
+fn map_info(path: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let map = MapScript::parse(&bytes).map_err(|error| error.to_string())?;
+    println!("bounds_min: {:?}", map.bounds_min);
+    println!("bounds_max: {:?}", map.bounds_max);
+    println!("static_model: {:?}", map.static_model);
+    println!("height_field: {:?}", map.height_field);
+    println!("objects: {}", map.objects.len());
+    for object in map.objects.iter().take(20) {
+        println!(
+            "  {} id={} position={:?} scale={:?}",
+            object.resource, object.id, object.position, object.scale
+        );
+    }
+    Ok(())
+}
+
+fn stm_info(path: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let model = StaticModelFile::parse(&bytes).map_err(|error| error.to_string())?;
+    let face_count: usize = model
+        .objects
+        .iter()
+        .flat_map(|object| &object.groups)
+        .map(|group| group.faces.len())
+        .sum();
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for position in model
+        .objects
+        .iter()
+        .flat_map(|object| object.positions.iter())
+    {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(position[axis]);
+            maximum[axis] = maximum[axis].max(position[axis]);
+        }
+    }
+    println!("materials: {}", model.materials.len());
+    println!("visual_objects: {}", model.objects.len());
+    println!("skipped_objects: {}", model.skipped_objects.len());
+    println!("faces: {face_count}");
+    println!("bounds_min: {minimum:?}");
+    println!("bounds_max: {maximum:?}");
+    for object in &model.objects {
+        println!(
+            "  {}: vertices={}, groups={}",
+            object.name,
+            object.positions.len(),
+            object.groups.len()
+        );
+    }
+    Ok(())
 }
 
 fn chr_info(path: &str) -> Result<(), String> {
@@ -203,6 +277,9 @@ fn usage() -> String {
         "  corum-assets mod-info <model.mod>",
         "  corum-assets mod-to-obj <model.mod> <output.obj>",
         "  corum-assets anm-info <motion.anm>",
+        "  corum-assets ttb-info <map.ttb>",
+        "  corum-assets map-info <scene.map>",
+        "  corum-assets stm-info <scene.stm>",
     ]
     .join("\n")
 }

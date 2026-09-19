@@ -179,6 +179,33 @@ Regras de arquitetura:
 
 ## Plano por marcos
 
+### Progresso já implementado
+
+- O workspace Rust contém um parser seguro de PAK e parsers estruturais de
+  `.CHR`, `.MOD` e `.ANM`.
+- Os 13 pacotes do cliente de referência foram lidos, totalizando 10.990
+  entradas.
+- 905 modelos e 259 animações do pacote de personagens foram validados
+  estruturalmente.
+- O crate `corum-viewer` abre uma janela nativa com `winit`/`wgpu`, carrega um
+  `.MOD` real, envia sua geometria à GPU e oferece câmera orbital e zoom.
+- O parser de `.TTB` lê dimensões, tamanho original do tile e os campos de
+  atributo, ocupação e seção. O parser textual de `.MAP` extrai limites,
+  referência ao `.STM` e objetos posicionados.
+- O binário `corum-sandbox` abre a topologia de um mapa real, permite caminhar
+  com WASD respeitando a colisão e mantém um mob de teste em patrulha.
+- O parser inicial de `.STM` reconhece a tabela de materiais e os objetos
+  visuais tipo 1. No mapa `1100`, ele recupera 53 materiais, 9 objetos visuais
+  e 9.361 triângulos, já renderizados com cores provisórias por material.
+- O crate `corum-assets` decodifica DDS (DXT1/3/5 e RGB/RGBA sem compressão) e
+  lê entradas de PAK em memória. A sandbox usa isso para texturizar o cenário
+  `1100` com as 51 texturas únicas de `Map_dds.pak`; lightmaps, luzes do `.MAP`,
+  objetos posicionados e céu ainda faltam. O roteiro detalhado de mapa, luz e
+  sombra, mobs e personagem está em `rust-client/docs/VISUAL_ROADMAP.md`.
+- A prova gráfica atual cobre malhas estáticas diretamente decodificáveis. O
+  próximo bloqueio visual é o cenário `.STM`; para personagens reais, é o
+  skinning/costuras usado pelos mobs, NPCs e personagens.
+
 ### Marco 0 — baseline reproduzível
 
 - Executar cliente e servidores originais em ambiente isolado.
@@ -211,7 +238,7 @@ Regras de arquitetura:
 
 - Documentar CDB, TTB, ERD e os formatos de modelo/animação realmente encontrados.
 - Converter um mapa, um personagem e uma animação para uma representação intermediária versionada.
-- Fazer o protótipo no Fyrox; comparar com a rota temporária do adaptador C++ quando necessário.
+- Evoluir o protótipo nativo `wgpu`; comparar com a rota temporária do adaptador C++ quando necessário.
 
 **Aceite:** o cliente Rust renderiza um mapa real, um personagem animado e sua posição recebida do servidor.
 

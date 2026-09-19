@@ -1,0 +1,15 @@
+[package]
+name = "corum-viewer"
+version = "0.1.0"
+edition = "2024"
+description = "Native model viewer for Corum Online assets"
+publish = false
+default-run = "corum-viewer"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+corum-assets = { path = "../corum-assets" }
+glam = "0.33.0"
+pollster = "1.0.0"
+wgpu = "30.0.0"
+winit = "0.30.0"

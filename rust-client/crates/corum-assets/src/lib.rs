@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
 pub mod chr;
+pub mod dds;
+pub mod map_script;
 pub mod model;
 pub mod motion;
+pub mod stm;
+pub mod ttb;
 
 use std::fmt;
 use std::fs::{self, File};
@@ -121,6 +125,19 @@ impl PakArchive {
             .entry(entry_name)
             .ok_or_else(|| PakError::EntryNotFound(entry_name.to_owned()))?;
         self.extract(entry, output_directory.as_ref())
+    }
+
+    pub fn read_entry(&self, entry_name: &str) -> Result<Vec<u8>, PakError> {
+        let entry = self
+            .entry(entry_name)
+            .ok_or_else(|| PakError::EntryNotFound(entry_name.to_owned()))?;
+        let size = usize::try_from(entry.size)
+            .map_err(|_| invalid(entry.data_offset, "entry does not fit in memory"))?;
+        let mut source = File::open(&self.path)?;
+        source.seek(SeekFrom::Start(entry.data_offset))?;
+        let mut bytes = vec![0_u8; size];
+        source.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 
     pub fn extract_all(&self, output_directory: impl AsRef<Path>) -> Result<u32, PakError> {

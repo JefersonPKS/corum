@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/corum-assets"]
+members = ["crates/corum-assets", "crates/corum-viewer"]
 resolver = "3"

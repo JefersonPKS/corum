@@ -2,6 +2,7 @@
 
 pub mod chr;
 pub mod dds;
+pub mod lightmap;
 pub mod map_script;
 pub mod model;
 pub mod motion;

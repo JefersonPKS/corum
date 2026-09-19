@@ -18,7 +18,7 @@ Legenda de certeza: **[confirmado]** medido nos arquivos ou visto na tela; **[hi
 | Geometria do cenário STM (20 objetos, 13.934 faces) | **[confirmado]** completa |
 | Texturas do cenário (51 únicas, DXT1, `Map_dds.pak`) | **[confirmado]** aplicadas, com mipmaps e alpha-test |
 | Colisão TTB, personagem e mob de teste (caixas) | funcionando |
-| Luz | VCL aplicado aos objetos tipo 1 e 20 luzes pontuais do `GX_LIGHT` (B1 e B2 prontos); falta o lightmap dos objetos tipo 3 |
+| Luz | Iluminação assada completa no `1100`: VCL (tipo 1) e lightmaps (tipo 3), em espaço gamma; luzes pontuais só em personagem e mob (B1–B4 prontos) |
 | Céu, névoa, água, objetos posicionados, mobs e personagem reais | ausentes |
 
 ---
@@ -48,13 +48,13 @@ Contexto: o cliente original usa o pipeline fixo do Direct3D 8. As pistas de que
 | # | Tarefa | Notas | Aceite |
 |---|---|---|---|
 | B1 ✅ | **Parser de VCL e uso como cor de vértice nos objetos tipo 1** | Feito. Ordem confirmada numericamente (diferença de luminância 3,9 nas arestas contra 16,6 em pares aleatórios) e na tela (variação de tom nas muralhas). O shader faz `textura × VCL` sem ganho extra; se, comparado ao cliente original, o resultado ficar escuro, o ganho (`MODULATE2X`?) é o primeiro suspeito **[hipótese]** | Cumprido: contagem `22.157 = 22.157`, `vcl-info` confere |
-| B2 ✅ (parcial) | Parser de `GX_LIGHT` e luzes pontuais no shader | Feito: 20 luzes num buffer de uniformes (até 32), atenuação quadrática até o raio, tecla `L`. Aplicadas só ao que não tem cor pré-calculada (personagem, mob e objetos tipo 3), porque num objeto com VCL a luz já foi somada na geração e seria contada duas vezes **[hipótese: o cliente original talvez nem as use em tempo de execução]**. O efeito no `1100` é sutil (tom frio no personagem e no chão). O inteiro `1000` continua sem significado; a intensidade (`× 1,5`) foi escolhida a olho | Falta comparar com o cliente original para calibrar intensidade e decidir se valem em tempo de execução |
-| B3 | **Decifrar `.lm`** | Cabeçalho `1, 32, 32` **[confirmado]**; o corpo não é uma imagem 32×32 simples. Experimentos: tratar `32×32` como tamanho de cada lightmap e dividir o corpo por `598` faces; testar formatos RGB565, RGB888 e L8; ver se `Map_light.pak` traz `.lm` vazios (`619`, `604`) **[confirmado]**, o que sugere que nem todo mapa usa lightmap. Se travar, desmontar o carregador nas DLLs `SS3D*` (esta configuração tem ferramentas IDA via MCP) | Imagem de lightmap legível exportada para PNG |
-| B4 | Aplicar lightmap nos objetos tipo 3 | Segundo conjunto de UV (as 3 coordenadas por face, portanto vértices não compartilhados entre faces); multiplicar por 2 costuma ser o padrão de `MODULATE2X` **[hipótese]** | Piso principal (`do_maintile-*`) com sombreado suave |
+| B2 ✅ | Parser de `GX_LIGHT` e luzes pontuais no shader | Feito: 20 luzes num buffer de uniformes (até 32), atenuação quadrática até o raio, tecla `L`. Como as poças de luz dos lightmaps/VCL têm cores compatíveis com as dessas luzes (verificação visual), elas parecem já estar assadas no cenário; hoje só iluminam personagem e mob. O inteiro `1000` continua sem significado; a intensidade (`× 1,5`) foi escolhida a olho | Falta comparar com o cliente original para calibrar a intensidade e decidir se o cliente as usa em tempo de execução (**[hipótese]**: usa nos atores) |
+| B3 ✅ | **Decifrar `.lm`** | Feito, sem precisar das DLLs: registros `(primeiro campo, largura, altura, texels RGB565)` em sequência, um por objeto tipo 3, na ordem do STM; fecha no byte exato do arquivo (9 registros no `1100`) e o STM repete o cabeçalho de cada um, o que confirma o emparelhamento. Falta entender o primeiro campo (1, 6, 38). `Map_light.pak` traz `.lm` de 0 bytes em alguns mapas (`619`, `604`): significa "sem lightmaps" | Cumprido: `lm-info` mostra os 9 pares batendo |
+| B4 ✅ | Aplicar lightmap nos objetos tipo 3 | Feito: 3 UVs por face vindos do STM, segundo `texture_2d_array`, `textura × lightmap`. Junto, o pipeline passou para espaço gamma (como o D3D8) para que a conta seja fiel. Ganho padrão ×1 (`B` alterna ×2): a inferência é que os pontos claros chegam a 252/255 e `0xFFFF`, então ×2 estouraria **[hipótese]** | Cumprido: piso e muralhas com poças de luz coloridas coerentes com o VCL |
 | B5 | Névoa e cor ambiente por mapa | Procurar parâmetros por mapa em `Manager/*.cdb` ou constantes no executável | Profundidade visual à distância |
 | B6 | Sombra de personagem e mobs: primeiro um "blob" (disco escuro projetado no chão), depois *shadow map* | O cliente original provavelmente usa sombra simples; comece com o blob e só evolua se a comparação com o original pedir | Personagem com sombra que segue o terreno |
 
-Ordem sugerida: ~~B1 → B2~~ (feitos) → **B3/B4 (lightmap, o próximo)** → B6 → B5. O chão principal (`JE_T_land_L_*`) e o piso da arena (`do_maintile-*`) são objetos tipo 3: continuam com iluminação genérica até o `.lm` ser decifrado.
+Ordem sugerida: ~~B1 → B2 → B3 → B4~~ (feitos) → **B6 (sombra de personagem)** → B5 (névoa/ambiente). Falta comparar com o cliente original (VM do Marco 0) para decidir o ganho ×1/×2 e a intensidade das luzes dos atores.
 
 ## Fase C — Mobs e personagem
 
@@ -86,7 +86,7 @@ Há três trilhas que quase não dependem uma da outra:
 | Formatos de modelo (C1–C3) | Decodificação de costuras/pesos em um modelo pequeno | mobs e personagem animados |
 | Dados de jogo (C5) e protocolo (Marcos 1–2 do plano) | Parser de CDB; login por CLI | integração com servidor |
 
-Recomendação: B1 e B2 já estão feitos. Seguir com **B3** (decifrar o `.lm`) e **C0** (modelo estático no sandbox), e deixar **C1** como investigação contínua, já que ela decide o cronograma dos mobs e do personagem.
+Recomendação: a iluminação assada do `1100` está completa (B1–B4). Seguir com **C0** (modelo estático no sandbox) e **A1** (abrir outros mapas, que testam também o `.lm` e o `.vcl` em outros casos), e deixar **C1** como investigação contínua, já que ela decide o cronograma dos mobs e do personagem.
 
 ## Riscos e decisões pendentes
 

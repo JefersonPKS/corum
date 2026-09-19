@@ -10,6 +10,7 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use corum_assets::PakArchive;
 use corum_assets::dds::DecodedImage;
+use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::{MapLight, MapScript};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
@@ -55,10 +56,15 @@ fn run() -> Result<(), String> {
         );
         None
     };
-    let textures = static_model
+    let mut textures = static_model
         .as_ref()
         .map(|model| MapTextures::load(model, &path))
         .unwrap_or_default();
+    if let Some(model) = static_model.as_ref()
+        && let Some(lightmaps) = load_lightmaps(&path)
+    {
+        textures.attach_lightmaps(model, &lightmaps);
+    }
     let baked = load_baked_colors(&path, static_model.as_ref());
     let lights = load_lights(&path);
     let scene = SandboxScene::new(
@@ -75,11 +81,37 @@ fn run() -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Reads `<map>.<extension>` next to the `.ttb`, or else from `Data\Map_light\Map_light.pak`,
+/// where the lighting files of the packed maps live.
+fn read_map_file(ttb_path: &Path, extension: &str) -> Option<Vec<u8>> {
+    let sibling = ttb_path.with_extension(extension);
+    if let Ok(bytes) = fs::read(&sibling) {
+        return Some(bytes);
+    }
+    let canonical = ttb_path.canonicalize().ok()?;
+    let data = canonical.parent()?.parent()?;
+    let archive = PakArchive::open(data.join("Map_light").join("Map_light.pak")).ok()?;
+    archive.read_entry(sibling.file_name()?.to_str()?).ok()
+}
+
+/// Baked lightmaps (`.lm`). An empty file is valid: some maps ship none.
+fn load_lightmaps(ttb_path: &Path) -> Option<LightmapFile> {
+    let bytes = read_map_file(ttb_path, "lm")?;
+    match LightmapFile::parse(&bytes) {
+        Ok(file) if file.maps.is_empty() => None,
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!("ignoring lightmaps: {error}");
+            None
+        }
+    }
+}
+
 /// Baked per-vertex lighting next to the `.ttb`. Absence is normal (not every map has one).
 fn load_baked_colors(ttb_path: &Path, model: Option<&StaticModelFile>) -> Option<VertexColors> {
     let model = model?;
     let path = ttb_path.with_extension("vcl");
-    let bytes = fs::read(&path).ok()?;
+    let bytes = read_map_file(ttb_path, "vcl")?;
     match VertexColors::parse(&bytes) {
         Ok(colors) if colors.colors.len() == model.vertex_lit_vertex_count() => {
             eprintln!("loaded VCL: {} baked vertex colours", colors.colors.len());
@@ -140,7 +172,7 @@ impl SandboxApplication {
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
         format!(
-            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes",
+            "Corum Map Viewer — {} — {} — Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho",
             path.file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("map.ttb"),
@@ -260,6 +292,9 @@ struct SandboxScene {
     show_collision: bool,
     show_entities: bool,
     show_point_lights: bool,
+    /// Multiplier for baked lighting (VCL and lightmaps): 1.0, or 2.0 to compare an
+    /// over-bright (`MODULATE2X`-style) interpretation. Toggled with `B`.
+    baked_gain: f32,
     lights: Vec<PointLight>,
     player: Vec3,
     mob: Vec3,
@@ -314,6 +349,7 @@ impl SandboxScene {
             show_collision: false,
             show_entities: true,
             show_point_lights: true,
+            baked_gain: 1.0,
             lights,
             player,
             mob,
@@ -334,6 +370,9 @@ impl SandboxScene {
             KeyCode::KeyG if pressed => self.show_collision = !self.show_collision,
             KeyCode::KeyH if pressed => self.show_entities = !self.show_entities,
             KeyCode::KeyL if pressed => self.show_point_lights = !self.show_point_lights,
+            KeyCode::KeyB if pressed => {
+                self.baked_gain = if self.baked_gain > 1.5 { 1.0 } else { 2.0 };
+            }
             _ => {}
         }
     }
@@ -570,8 +609,16 @@ fn build_stm_vertices(
     let mut objects = Vec::with_capacity(model.objects.len());
     // `.vcl` colours follow the file order of the type 1 objects, one per vertex.
     let mut baked_base = 0_usize;
+    let mut lightmapped_objects = 0_usize;
     for object in &model.objects {
         let vertex_start = vertices.len();
+        let object_lightmap = if object.object_type == 3 {
+            let index = lightmapped_objects;
+            lightmapped_objects += 1;
+            textures.lightmap_layer(index)
+        } else {
+            None
+        };
         let object_colors = if object.object_type == 1 {
             let base = baked_base;
             baked_base += object.positions.len();
@@ -592,7 +639,7 @@ fn build_stm_vertices(
                 material_color(texture_name, group.material_index)
             };
             let layer = layer.map_or(-1.0, |layer| layer as f32);
-            for face in &group.faces {
+            for (face_index, face) in group.faces.iter().enumerate() {
                 let Some(source_positions) = face
                     .iter()
                     .map(|index| object.positions.get(usize::from(*index)).copied())
@@ -626,7 +673,15 @@ fn build_stm_vertices(
                             let [red, green, blue, _] = colors[usize::from(face[corner])];
                             vertex.baked([red, green, blue].map(|c| f32::from(c) / 255.0))
                         }
-                        _ => vertex,
+                        _ => match (
+                            object_lightmap,
+                            group.lightmap_coordinates.get(face_index * 3 + corner),
+                        ) {
+                            (Some(lightmap), Some(uv)) if layer >= 0.0 => {
+                                vertex.lightmapped(*uv, lightmap as f32)
+                            }
+                            _ => vertex,
+                        },
                     });
                 }
             }
@@ -820,16 +875,21 @@ struct Vertex {
     layer: f32,
     /// `1.0` when `color` is baked lighting (VCL) that replaces dynamic lighting.
     baked: f32,
+    lightmap_uv: [f32; 2],
+    /// Lightmap array layer, or `-1.0` when the vertex has no lightmap.
+    lightmap_layer: f32,
 }
 
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x3,
         2 => Float32x3,
         3 => Float32x2,
         4 => Float32,
         5 => Float32,
+        6 => Float32x2,
+        7 => Float32,
     ];
 
     fn new(position: Vec3, normal: Vec3, color: [f32; 3]) -> Self {
@@ -844,7 +904,15 @@ impl Vertex {
             uv,
             layer,
             baked: 0.0,
+            lightmap_uv: [0.0, 0.0],
+            lightmap_layer: -1.0,
         }
+    }
+
+    fn lightmapped(mut self, uv: [f32; 2], layer: f32) -> Self {
+        self.lightmap_uv = uv;
+        self.lightmap_layer = layer;
+        self
     }
 
     fn baked(mut self, color: [f32; 3]) -> Self {
@@ -1052,6 +1120,17 @@ impl Renderer {
             .get_default_config(&adapter, width, height)
             .ok_or_else(|| "the selected GPU cannot present to this window".to_owned())?;
         config.present_mode = wgpu::PresentMode::AutoVsync;
+        // Direct3D 8 blends raw colour values (no sRGB decode/encode), so baked lighting is
+        // modulated in that same "gamma space" to match the original's look.
+        let gamma_format = config.format.remove_srgb_suffix();
+        if gamma_format != config.format
+            && surface
+                .get_capabilities(&adapter)
+                .formats
+                .contains(&gamma_format)
+        {
+            config.format = gamma_format;
+        }
         surface.configure(&device, &config);
 
         let camera = Camera::new(scene.player + Vec3::Y * 0.7);
@@ -1217,9 +1296,10 @@ impl Renderer {
             self.vertex_count = vertices.len() as u32;
         }
         if self.config.height != 0 {
-            let uniform = self
+            let mut uniform = self
                 .camera
                 .uniform(self.config.width as f32 / self.config.height as f32);
+            uniform.light_direction[3] = self.scene.baked_gain;
             self.queue
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
             let lights = LightsUniform::new(&self.scene.lights, self.scene.show_point_lights);
@@ -1264,9 +1344,9 @@ impl Renderer {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.018,
-                        g: 0.027,
-                        b: 0.045,
+                        r: 0.143,
+                        g: 0.179,
+                        b: 0.235,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
@@ -1334,6 +1414,10 @@ struct MapTextures {
     layer_size: u32,
     images: Vec<DecodedImage>,
     material_layers: Vec<Option<u32>>,
+    lightmap_size: u32,
+    lightmaps: Vec<DecodedImage>,
+    /// Lightmap layer per lightmapped (type 3) object, in scene order.
+    lightmap_layers: Vec<Option<u32>>,
 }
 
 impl MapTextures {
@@ -1404,6 +1488,51 @@ impl MapTextures {
         }
     }
 
+    /// Pairs the k-th type 3 object with the k-th lightmap record. The object repeats its
+    /// record's header in its trailing data, so a mismatching pair is skipped instead of
+    /// showing another object's lighting.
+    fn attach_lightmaps(&mut self, model: &StaticModelFile, file: &LightmapFile) {
+        let objects = model
+            .objects
+            .iter()
+            .filter(|object| object.object_type == 3);
+        for (index, object) in objects.enumerate() {
+            let layer = file.maps.get(index).and_then(|map| {
+                let agrees = object.lightmap.is_some_and(|descriptor| {
+                    descriptor.first_field == map.first_field
+                        && descriptor.width == map.width
+                        && descriptor.height == map.height
+                });
+                if !agrees {
+                    eprintln!("lightmap #{index} does not match object '{}'", object.name);
+                    return None;
+                }
+                self.lightmaps.push(DecodedImage {
+                    width: map.width,
+                    height: map.height,
+                    rgba: map.rgba.clone(),
+                });
+                Some((self.lightmaps.len() - 1) as u32)
+            });
+            self.lightmap_layers.push(layer);
+        }
+        self.lightmap_size = self
+            .lightmaps
+            .iter()
+            .map(|image| image.width.max(image.height))
+            .max()
+            .unwrap_or(1);
+        eprintln!(
+            "loaded LM: {} lightmaps for {} lightmapped objects",
+            self.lightmaps.len(),
+            self.lightmap_layers.len()
+        );
+    }
+
+    fn lightmap_layer(&self, object_index: usize) -> Option<u32> {
+        self.lightmap_layers.get(object_index).copied().flatten()
+    }
+
     fn layer_for_material(&self, material_index: u32) -> Option<u32> {
         self.material_layers
             .get(material_index as usize)
@@ -1429,7 +1558,7 @@ impl MapTextures {
             mip_level_count: mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -1478,6 +1607,64 @@ impl MapTextures {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
+
+        // Lightmaps hold raw light intensity, so they are sampled without sRGB decoding.
+        let lightmap_size = self.lightmap_size.max(1);
+        let lightmap_layers = self.lightmaps.len().max(1) as u32;
+        let lightmap_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("map lightmap array"),
+            size: wgpu::Extent3d {
+                width: lightmap_size,
+                height: lightmap_size,
+                depth_or_array_layers: lightmap_layers,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for layer in 0..lightmap_layers {
+            let image = self.lightmaps.get(layer as usize).unwrap_or(&placeholder);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &lightmap_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &resample_bilinear(image, lightmap_size),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(lightmap_size * 4),
+                    rows_per_image: Some(lightmap_size),
+                },
+                wgpu::Extent3d {
+                    width: lightmap_size,
+                    height: lightmap_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let lightmap_view = lightmap_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let lightmap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("map lightmap sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("map texture sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -1508,6 +1695,22 @@ impl MapTextures {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1521,6 +1724,14 @@ impl MapTextures {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&lightmap_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&lightmap_sampler),
                 },
             ],
         });
@@ -1537,6 +1748,33 @@ fn resample(image: &DecodedImage, size: u32) -> Vec<u8> {
             let source_x = (u64::from(x) * u64::from(image.width) / u64::from(size)) as usize;
             let offset = (source_y * image.width as usize + source_x) * 4;
             output.extend_from_slice(&image.rgba[offset..offset + 4]);
+        }
+    }
+    output
+}
+
+/// Bilinear resize to a square layer, so small lightmaps look like the smoothly filtered
+/// textures the original renderer would have shown.
+fn resample_bilinear(image: &DecodedImage, size: u32) -> Vec<u8> {
+    let (width, height) = (image.width as usize, image.height as usize);
+    let mut output = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        let source_y = ((y as f32 + 0.5) * height as f32 / size as f32 - 0.5).max(0.0);
+        let y0 = (source_y.floor() as usize).min(height - 1);
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = source_y - y0 as f32;
+        for x in 0..size {
+            let source_x = ((x as f32 + 0.5) * width as f32 / size as f32 - 0.5).max(0.0);
+            let x0 = (source_x.floor() as usize).min(width - 1);
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = source_x - x0 as f32;
+            for channel in 0..4 {
+                let texel =
+                    |px: usize, py: usize| f32::from(image.rgba[(py * width + px) * 4 + channel]);
+                let top = texel(x0, y0) * (1.0 - fx) + texel(x1, y0) * fx;
+                let bottom = texel(x0, y1) * (1.0 - fx) + texel(x1, y1) * fx;
+                output.push((top * (1.0 - fy) + bottom * fy + 0.5) as u8);
+            }
         }
     }
     output

@@ -98,7 +98,7 @@ Um mapa `N` é composto por arquivos em `Data\Map` (soltos ou dentro de `Map_stm
 | `N.map` | script textual: limites, referência ao `.stm`, objetos e luzes | `map_script::MapScript` (`GX_LIGHT` incluído) |
 | `N.stm` | geometria estática do cenário (posições, UVs, materiais, faces) | `stm::StaticModelFile` |
 | `N.vcl` | cor pré-calculada por vértice dos objetos STM tipo 1 | `vcl::VertexColors` |
-| `N.lm` | lightmaps dos objetos STM tipo 3 | ainda sem parser (formato **não** decifrado) |
+| `N.lm` | lightmaps (RGB565) dos objetos STM tipo 3 | `lightmap::LightmapFile` |
 | `N.lfg`, `N.ofg`, `N.hfl`, `N.am2`, `N.vch` | luzes/efeitos/altura/outros | não investigados |
 
 Tudo é little-endian. Nomes de objetos e materiais estão em code page legada (CP949): o parser usa `from_utf8_lossy`, então nomes coreanos saem com `�`. Isso é inofensivo para o desenho, mas não use esses nomes como chave estável.
@@ -164,7 +164,7 @@ Depois do cabeçalho: `V` posições `[f32; 3]`, `V` UVs `[f32; 2]` e `B` índic
 **Fim do objeto depende do tipo:**
 
 - **Tipo 1 (nome termina em ` V`, iluminação por vértice):** o grupo termina nas faces. Após o último grupo há 16 bytes não interpretados e `V × [f32; 3]` (provavelmente normais por vértice; o sandbox ainda usa a normal da face). O objeto tem 0 coordenadas de lightmap.
-- **Tipo 3 (nome termina em ` L`, lightmap):** cada grupo é seguido por `lightmap × [f32; 2]`; o valor é sempre `3 × faces` (um UV de lightmap por canto de face). Depois dos grupos há dados ainda não decodificados, então o parser procura o próximo cabeçalho por varredura.
+- **Tipo 3 (nome termina em ` L`, lightmap):** cada grupo é seguido por `lightmap × [f32; 2]`; o valor é sempre `3 × faces` (um UV de lightmap por canto de face, em ordem de face, lidos em `StaticFaceGroup::lightmap_coordinates`). Depois dos grupos vêm 12 bytes zerados e o cabeçalho `(primeiro campo, largura, altura)` do registro `.lm` do objeto (`StaticObject::lightmap`), seguido de floats ainda não interpretados (parecem uma normal/plano e limites do objeto). O parser procura o próximo cabeçalho de objeto por varredura.
 
 O `1100` tem 11 objetos tipo 1 (22.157 vértices) e 9 tipo 3 (598 faces, 1.794 UVs de lightmap).
 
@@ -178,9 +178,22 @@ O `1100` tem 11 objetos tipo 1 (22.157 vértices) e 9 tipo 3 (598 faces, 1.794 U
 
 Sem cabeçalho: uma sequência de `u32` em `AARRGGBB` (na memória: bytes `B, G, R, A`; alfa `0xFF` nas amostras). No `1100`, `88.628 / 4 = 22.157` cores, exatamente a soma dos vértices dos objetos tipo 1. As cores seguem a ordem dos objetos tipo 1 no `.stm` e, dentro de cada objeto, a ordem dos vértices. Isso foi verificado: a diferença média de luminância entre vértices ligados por uma aresta é 3,9, contra 16,6 entre pares aleatórios do mesmo objeto (o alfa é sempre `0xFF` e a luminância varia de 70 a 252). `corum-assets vcl-info <N.vcl> <N.stm>` confere a contagem. É a iluminação "assada" desses objetos, com tons neutros a levemente coloridos.
 
-### LM — lightmaps (parcial)
+### LM — lightmaps (decifrado, parser em `lightmap::LightmapFile`)
 
-Cabeçalho de 12 bytes: `1`, `32`, `32` (`u32`). O restante (`63.584` bytes) tem muitas palavras repetidas (`0x42282842` aparece 11.031 vezes, `0` outras 2.816) e as 512 primeiras palavras são idênticas. Não é uma imagem simples de `32×32`: falta descobrir se `32×32` é o tamanho de cada lightmap, de uma grade de células ou de um atlas, e o formato de pixel. Os objetos tipo 3 fornecem 3 UVs de lightmap por face, que devem endereçar este arquivo. Os pacotes `Map_light.pak` trazem `.lm` com tamanho 0 para alguns mapas (`619`, `604`), então esse mapa também pode simplesmente não ter lightmaps.
+O arquivo é uma sequência de registros, sem cabeçalho geral, que termina exatamente no fim do arquivo:
+
+```text
+u32  primeiro campo   (1 na maioria; 6 e 38 nos dois atlas do 1100; significado desconhecido)
+u32  largura
+u32  altura
+     largura × altura texels RGB565, little-endian (2 bytes cada)
+```
+
+**[confirmado no `1100`]** 9 registros (32×32 ×7, 64×128 e 128×128) percorrem os 63.596 bytes sem sobra. Há um registro por objeto STM tipo 3, **na ordem em que os objetos aparecem no `.stm`**: o objeto repete `(primeiro campo, largura, altura)` do seu registro nos dados finais (ver o STM), e os 9 pares conferem (`corum-assets lm-info <N.lm> <N.stm>`).
+
+O conteúdo é iluminação: um cinza uniforme (`0x4228`, ≈ RGB 66/69/66) com "poças" de luz quente e azulada, além de regiões pretas não usadas nos atlas. Quatro dos seis mapas 32×32 do piso são totalmente uniformes. Os UVs que apontam para os registros são os 3 por face guardados no STM. Um `.lm` de 0 bytes (como `619` e `604` em `Map_light.pak`) é válido e significa "sem lightmaps".
+
+Fica em aberto: o significado do primeiro campo e se o valor de fábrica do cinza (`0x4228`) é um ambiente constante do mapa.
 
 ## Uso
 

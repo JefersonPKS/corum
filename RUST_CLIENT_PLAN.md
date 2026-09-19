@@ -199,9 +199,10 @@ Regras de arquitetura:
   e 9.361 triângulos, já renderizados com cores provisórias por material.
 - O crate `corum-assets` decodifica DDS (DXT1/3/5 e RGB/RGBA sem compressão) e
   lê entradas de PAK em memória. A sandbox usa isso para texturizar o cenário
-  `1100` com as 51 texturas únicas de `Map_dds.pak`, aplica a cor por vértice
-  (`.vcl`) e as luzes pontuais do `.MAP`; lightmaps, objetos posicionados e céu
-  ainda faltam. O roteiro detalhado de mapa, luz e
+  `1100` com as 51 texturas únicas de `Map_dds.pak`, aplica a iluminação
+  assada (cor por vértice `.vcl` e lightmaps `.lm`, ambos decifrados) em espaço
+  gamma e as luzes pontuais do `.MAP` nos atores; objetos posicionados, céu e
+  sombras de atores ainda faltam. O roteiro detalhado de mapa, luz e
   sombra, mobs e personagem está em `rust-client/docs/VISUAL_ROADMAP.md`.
 - A prova gráfica atual cobre malhas estáticas diretamente decodificáveis. O
   próximo bloqueio visual é o cenário `.STM`; para personagens reais, é o

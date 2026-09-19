@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use corum_assets::chr::ChrManifest;
+use corum_assets::lightmap::LightmapFile;
 use corum_assets::map_script::MapScript;
 use corum_assets::model::ModelFile;
 use corum_assets::motion::MotionFile;
@@ -42,6 +43,7 @@ fn run() -> Result<(), String> {
         "map-info" if arguments.len() == 2 => map_info(&arguments[1]),
         "stm-info" if arguments.len() == 2 => stm_info(&arguments[1]),
         "vcl-info" if arguments.len() == 3 => vcl_info(&arguments[1], &arguments[2]),
+        "lm-info" if arguments.len() == 3 => lm_info(&arguments[1], &arguments[2]),
         "help" | "--help" | "-h" => {
             println!("{}", usage());
             Ok(())
@@ -76,6 +78,44 @@ fn map_info(path: &str) -> Result<(), String> {
         println!(
             "  {} id={} position={:?} scale={:?}",
             object.resource, object.id, object.position, object.scale
+        );
+    }
+    Ok(())
+}
+
+fn lm_info(lm_path: &str, stm_path: &str) -> Result<(), String> {
+    let lightmaps = LightmapFile::parse(&fs::read(lm_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let stm = StaticModelFile::parse(&fs::read(stm_path).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    let objects: Vec<_> = stm
+        .objects
+        .iter()
+        .filter(|object| object.object_type == 3)
+        .collect();
+    println!("lightmaps: {}", lightmaps.maps.len());
+    println!("lightmapped_objects: {}", objects.len());
+    for (index, object) in objects.iter().enumerate() {
+        let map = lightmaps.maps.get(index);
+        let agrees = match (map, object.lightmap) {
+            (Some(map), Some(descriptor)) => {
+                map.first_field == descriptor.first_field
+                    && map.width == descriptor.width
+                    && map.height == descriptor.height
+            }
+            _ => false,
+        };
+        println!(
+            "  #{index} {} -> {} {}",
+            object.name,
+            map.map_or_else(
+                || "missing".to_owned(),
+                |map| format!(
+                    "{}x{} (first field {})",
+                    map.width, map.height, map.first_field
+                )
+            ),
+            if agrees { "header matches" } else { "MISMATCH" }
         );
     }
     Ok(())
@@ -303,6 +343,7 @@ fn usage() -> String {
         "  corum-assets map-info <scene.map>",
         "  corum-assets stm-info <scene.stm>",
         "  corum-assets vcl-info <scene.vcl> <scene.stm>",
+        "  corum-assets lm-info <scene.lm> <scene.stm>",
     ]
     .join("\n")
 }

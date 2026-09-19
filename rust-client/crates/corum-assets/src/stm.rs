@@ -29,12 +29,25 @@ pub struct StaticObject {
     pub positions: Vec<[f32; 3]>,
     pub texture_coordinates: Vec<[f32; 2]>,
     pub groups: Vec<StaticFaceGroup>,
+    /// Lightmap record this type 3 object points at (`None` for other types).
+    pub lightmap: Option<LightmapDescriptor>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StaticFaceGroup {
     pub material_index: u32,
     pub faces: Vec<[u16; 3]>,
+    /// Type 3 only: three lightmap UVs per face (one per corner), in face order.
+    pub lightmap_coordinates: Vec<[f32; 2]>,
+}
+
+/// Header of the `.lm` record an object uses, repeated in the object's trailing data.
+/// Objects are paired with lightmap records by order; this lets the pairing be verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightmapDescriptor {
+    pub first_field: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,20 +196,28 @@ fn parse_visual_object(
             faces.push(face);
             cursor += 6;
         }
-        groups.push(StaticFaceGroup {
-            material_index,
-            faces,
-        });
+        let mut lightmap_coordinates = Vec::new();
         if object_type == 3 {
             let lightmap_bytes = lightmap_coordinate_count
                 .checked_mul(8)
                 .ok_or_else(|| StmError::new(cursor, "lightmap coordinate array overflow"))?;
             require(bytes, cursor, lightmap_bytes)?;
-            cursor += lightmap_bytes;
+            lightmap_coordinates.reserve(lightmap_coordinate_count);
+            for _ in 0..lightmap_coordinate_count {
+                lightmap_coordinates.push([f32_at(bytes, cursor)?, f32_at(bytes, cursor + 4)?]);
+                cursor += 8;
+            }
         }
+        groups.push(StaticFaceGroup {
+            material_index,
+            faces,
+            lightmap_coordinates,
+        });
     }
 
+    let mut lightmap = None;
     if object_type == 3 {
+        lightmap = lightmap_descriptor(bytes, cursor);
         cursor = find_next_object(bytes, cursor).unwrap_or(bytes.len());
     } else {
         require(bytes, cursor, 16)?;
@@ -215,9 +236,24 @@ fn parse_visual_object(
             positions,
             texture_coordinates,
             groups,
+            lightmap,
         },
         cursor,
     ))
+}
+
+/// The trailing data of a type 3 object is 12 zero bytes followed by `(first field, width,
+/// height)` of its `.lm` record. Anything implausible is treated as "no descriptor".
+fn lightmap_descriptor(bytes: &[u8], after_groups: usize) -> Option<LightmapDescriptor> {
+    let start = after_groups.checked_add(12)?;
+    let first_field = u32_at(bytes, start).ok()?;
+    let width = u32_at(bytes, start + 4).ok()?;
+    let height = u32_at(bytes, start + 8).ok()?;
+    ((1..=4096).contains(&width) && (1..=4096).contains(&height)).then_some(LightmapDescriptor {
+        first_field,
+        width,
+        height,
+    })
 }
 
 fn is_object_header(bytes: &[u8], start: usize) -> bool {
@@ -379,6 +415,7 @@ mod tests {
         let object_start = FILE_HEADER_SIZE + MATERIAL_SIZE;
         let data_start = object_start + OBJECT_DATA_OFFSET;
         let file_size = data_start + 36 + 24 + GROUP_HEADER_SIZE + 6 + 24 + 128;
+        let groups_end = data_start + 36 + 24 + GROUP_HEADER_SIZE + 6 + 24;
         let mut bytes = vec![0_u8; file_size];
         bytes[0..4].copy_from_slice(&1_u32.to_le_bytes());
         bytes[4..8].copy_from_slice(&1_u32.to_le_bytes());
@@ -404,9 +441,32 @@ mod tests {
             cursor += 2;
         }
 
+        for (slot, value) in [(12, 1_u32), (16, 32), (20, 16)] {
+            bytes[groups_end + slot..groups_end + slot + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, value) in [0.25_f32, 0.5, 0.75, 0.5, 0.25, 0.75]
+            .into_iter()
+            .enumerate()
+        {
+            let offset = cursor + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+
         let model = StaticModelFile::parse(&bytes).expect("lightmapped STM should parse");
         assert_eq!(model.objects.len(), 1);
         assert_eq!(model.objects[0].name, "floor");
         assert_eq!(model.objects[0].groups[0].faces, vec![[0, 1, 2]]);
+        assert_eq!(
+            model.objects[0].groups[0].lightmap_coordinates,
+            vec![[0.25, 0.5], [0.75, 0.5], [0.25, 0.75]]
+        );
+        assert_eq!(
+            model.objects[0].lightmap,
+            Some(LightmapDescriptor {
+                first_field: 1,
+                width: 32,
+                height: 16
+            })
+        );
     }
 }

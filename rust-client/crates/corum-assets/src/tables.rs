@@ -268,14 +268,15 @@ pub fn schema_for(stem: &str) -> Option<Schema> {
             .u8("flag"),
 
         // ----- interface (InterfaceSpr.h) -----
+        // Como `CreateSpriteObject(arquivo, x, y, largura, altura)`: o recorte da imagem (tipo 0 = inteira).
         "interfaceresourceinfo" => builder
             .u16("id")
             .text("file_name", 50)
             .u8("type")
-            .u16("left")
-            .u16("top")
-            .u16("right")
-            .u16("bottom"),
+            .u16("x")
+            .u16("y")
+            .u16("width")
+            .u16("height"),
         "interfacespritemanager" => builder.u16("id").u16("resource_id"),
         "interfacecomponentinfo" => builder
             .u16("interface_id")
@@ -291,12 +292,19 @@ pub fn schema_for(stem: &str) -> Option<Schema> {
             .f32("scale_y")
             .u8("value")
             .u8("pos"),
-        // [hipótese] o arquivo tem 4 bytes a mais que `INTERFACE_FRAME_INFO`; os 13 bytes depois do
-        // nome ficam em hexadecimal até se saber a ordem certa.
+        // [confirmado] o arquivo tem 4 bytes a mais que `INTERFACE_FRAME_INFO`: a posição inicial
+        // `left, top` (o minimapa, 159 x 186 em x = 865, encosta no canto direito de 1024 x 768).
         "interfaceframeinfo" => builder
             .u16("frame_id")
             .text("name", 30)
-            .hex("unknown_body", 13),
+            .u16("width")
+            .u16("height")
+            .u16("left")
+            .u16("top")
+            .u8("kind")
+            .u16("index")
+            .u8("active")
+            .u8("scroll"),
 
         // ----- habilidades (BASESKILL) -----
         "skill" | "skilleffect" => builder

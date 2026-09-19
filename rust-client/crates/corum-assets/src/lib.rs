@@ -15,8 +15,10 @@ pub mod pose;
 pub mod schema;
 pub mod stm;
 pub mod tables;
+pub mod tga;
 pub mod tiff;
 pub mod ttb;
+pub mod ui;
 pub mod vcl;
 
 use std::fmt;

@@ -369,7 +369,7 @@ Como a pasta `System` do Lineage 2 (`itemname`, `weapongrp`, `armorgrp`, `skillg
 | `npctable`, `CPTable`, `Level`, `GuardianLevel`, `BaseClassInfo`, `Help`, `KeyInfo`, `GroupInfo`, `ItemMaking`, `Itemtalisman`… | — | — | NPCs, CP, níveis, ajuda, teclas, grupos, receitas |
 | `questtitle`, `questlist`, `questnpc` | 38 / 218 / 334 | 2 / 13 / 3 | missões: títulos, texto, dica, alvos (`target1..5`) e NPCs |
 | `Hairshopoption` | 192 | 9 | estilos de cabelo da loja (`model_id` = id em `DefResource.erd`, `1001` = `ph101001.MOD`) |
-| `InterfaceResourceInfo`, `InterfaceSpriteManager`, `InterfaceComponentInfo`, `InterfaceFrameInfo` | 496 / 506 / 1.657 / 84 | 7 / 2 / 14 / 3 | interface: arquivos e recortes de imagem, componentes com posição/escala, janelas |
+| `InterfaceResourceInfo`, `InterfaceSpriteManager`, `InterfaceComponentInfo`, `InterfaceFrameInfo` | 496 / 506 / 1.657 / 84 | 7 / 2 / 14 / 10 | interface: arquivos e recortes de imagem (`x, y, width, height`), componentes com posição/escala, janelas (largura, altura, posição inicial); ver a seção da interface |
 | `EventDungeonDescription` | 2 | 2 | textos longos de eventos de dungeon |
 
 - **Diferenças entre o código-fonte (2005) e o cliente (2007) [hipótese quanto ao significado]:** `ItemConsumable` tem 3 bytes a mais que `BASEITEM_CONSUMABLE` (um `u16` entre `min_lev` e `max_lev`, sempre 0, e um `u8` final de 0 ou 1: colunas `unknown_min_lev_2` e `unknown_tail`); `ItemBag` tem 4 bytes a mais no fim (`unknown_tail`, sempre 0); `ItemAttrDefine` tem 111 B (texto de 100 B + `unknown_flag`); `Level.cdb` tem 9 B por nível (o `SLEVEL_EXP` do código-fonte, 5 B, vale só para `GuardianLevel`). `Itemtalisman` não tem struct no código-fonte: só o cabeçalho de item foi separado e os 162 B seguintes ficam em `unknown_body` (hex).
@@ -414,6 +414,25 @@ Como o cliente original acha o modelo de um item (`ItemDataName` e `ItemAttach`,
 - **Personagem vestido [confirmado no código do cliente e na tela]:** `DungeonProcess.cpp` monta um jogador com `wArmor`, `wHead`, `wHelmet`, `wHandR` e `wHandL`. **A armadura é o corpo inteiro** (`ItemDataName(armor, classe − 1)`: `<model>_<classe−1>.chr`, com o `.mod` de mesmo nome), e sem armadura vale o corpo base da classe (`RESTYPE_BASE_BODY`, `pm01000`…`pm05000`, ids `0x03000001`–`0x03000005` do `DefResource.erd`). A **cabeça** é `RESTYPE_HEAD_MALE` (classes 1–3, `ph101001`…) ou `_FEMALE` (4–5, `ph201001`…), presa a `Bip01 Head`; elmo (item de tipo 10) na cabeça, arma na mão direita, escudo (tipo 12) na esquerda. Isso confirma que o byte alto dos ids do `DefResource.erd` é o `RESTYPE_*`: 1 = cabeças masculinas (22), 2 = femininas (22), 3 = corpos base (5).
 - **Armaduras vestíveis por classe** (`item-check`): 311 armaduras de corpo (`pm…`); têm modelo para a classe 1: 231, classe 2: 242, classe 3: 235, classe 4: 241, classe 5: 247 (as demais são de outra classe).
 - **Limites:** itens `.chr` são mostrados na pose de bind, sem o `.anm` próprio; o item `812` (garra "Marbes' Death Fist") tem uma malha de layout ainda não decifrado (das ~150 conhecidas) e só o plano `add1` aparece.
+
+## Interface: janelas e sprites (módulos `ui` e `tga`, 2026-09-19)
+
+Layout completo de como o cliente monta as janelas (`Interface.cpp`, `InterfaceSpr.h`, `Menu.h`), conferido nos arquivos:
+
+| Tabela | Registro | O que é |
+|---|---|---|
+| `InterfaceFrameInfo` (84) | 45 B: `frame_id`, `name`[30], `width`, `height`, `left`, `top`, `kind`, `index`, `active`, `scroll` | uma janela por registro, para a tela de **1024 × 768**. O arquivo tem 4 bytes a mais que a struct do código-fonte: a posição inicial `left, top` (o minimapa, 159 × 186 em x = 865, encosta no canto direito) |
+| `InterfaceComponentInfo` (1.657) | 25 B | o que há dentro da janela `interface_id`, em coordenadas da janela. `resource_type` 3 = **sprite** (`resource_id` é id do `InterfaceSpriteManager`), 1 = **área de colisão** (`left, top, right, bottom` é a caixa e `resource_id` é o `CHECKTYPE`) |
+| `InterfaceSpriteManager` (506) | 4 B: id, id do recurso | sprite → recurso |
+| `InterfaceResourceInfo` (496) | 61 B: id, arquivo[50], tipo, `x`, `y`, `width`, `height` | imagem no pacote `UI` e recorte. Como `CreateSpriteObject(arquivo, x, y, largura, altura)`; tipo 0 = imagem inteira |
+
+- **`CHECKTYPE` [confirmado em `Menu.h`]:** 1 fechar, 2 botão, 3 botão de pressão, 4 rolagem, 5 mover a janela (barra de título), 6 item, 7 ataque, 8 NPC, 9 guardião.
+- **Estados:** vários sprites no mesmo lugar são os estados do mesmo botão (normal, sob o mouse, apertado); o desenho estático usa só o primeiro. A marca de opção ligada (`checkv1.tif`) também não entra.
+- **Janelas principais [id = `frame_id`]:** 2 `ITEM` (256 × 640), 3 `CHAR` (256 × 384), 4 `SKILL` (320 × 512), 5 `GAMEMENU` (opções, 256 × 256), 6 `MINIMAP`, 7 `CHAT`; a barra do jogador (`INTERFACE`, 1) não tem componentes: é desenhada por código.
+- **Atalhos originais [`KeyConfig.ini`]:** `S` habilidades, `E` grupo, `W` trocar arma, `A` personagem, `T` inventário, `L` limpar o chat, `O` opções, `F`/`G` auto-ataque, `1`–`8` cinto de itens.
+- **`.tga` da interface [confirmado]:** 192 arquivos de cor verdadeira sem compressão, 24 bits (sem alfa), normalmente 256 × 256 (atlas de botões), origem embaixo à esquerda: `DecodedImage::from_tga` inverte as linhas e também aceita RLE (tipo 10), 32 bits e origem no topo. Os `.tif` da interface já saem na orientação certa (não usam a inversão dos materiais do mapa).
+- **API:** `ui::UiCatalog::load(<Data\Manager>)` (`window_sprites`, `window_hit_boxes`, `window_named`) e `ui::UiDesktop` (mesa de janelas: `open/toggle/close_top`, `press`, `motion`, `release`, com ordem, fechar e arrastar). Testados com dados sintéticos e, com `CORUM_DATA`, com as tabelas reais (as 84 janelas, o minimapa em 865 + 159 = 1024 e o botão de fechar de `ITEM` em `[242, 4, 256, 16]`).
+- **Visualização rápida:** `python tools/preview_ui.py export target/verification/ui 2 3 4 5` desenha as janelas dos ids dados a partir do TSV do "System".
 
 ## Navegação e altura do terreno (2026-09-19)
 

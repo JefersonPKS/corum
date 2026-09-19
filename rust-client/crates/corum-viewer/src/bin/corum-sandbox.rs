@@ -21,8 +21,10 @@ use corum_assets::navigation;
 use corum_assets::pose::{Skeleton, transform_point, transform_vector};
 use corum_assets::stm::StaticModelFile;
 use corum_assets::ttb::TileMap;
+use corum_assets::ui::{UiCatalog, UiDesktop};
 use corum_assets::vcl::VertexColors;
 use glam::{Mat4, Vec2, Vec3};
+use ui_gpu::UiGpu;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
@@ -30,6 +32,9 @@ use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+#[path = "../ui_gpu.rs"]
+mod ui_gpu;
 
 const DEFAULT_MAP: &str = r"D:\Games\CorumOnline\Data\Map\1100.ttb";
 const DEFAULT_DATA_DIRECTORY: &str = r"D:\Games\CorumOnline\Data";
@@ -57,6 +62,23 @@ const ACTOR_YAW_OFFSET: f32 = 0.0;
 /// Pixels the cursor may move between press and release for the click to still be a move order
 /// (a longer drag orbits the camera instead).
 const CLICK_DRAG_LIMIT: f32 = 5.0;
+
+/// Interface window a key opens or closes. Play mode uses the original client's keys (`KeyConfig.ini`:
+/// `T` inventory, `A` character, `S` skills, `O` options); the development mode keeps `WASD` for
+/// moving and uses `I`, `C`, `K` and `P` instead.
+fn ui_hotkey(code: KeyCode, game: bool) -> Option<&'static str> {
+    match (game, code) {
+        (true, KeyCode::KeyT) | (false, KeyCode::KeyI) => Some("ITEM"),
+        (true, KeyCode::KeyA) | (false, KeyCode::KeyC) => Some("CHAR"),
+        (true, KeyCode::KeyS) | (false, KeyCode::KeyK) => Some("SKILL"),
+        (true, KeyCode::KeyO) | (false, KeyCode::KeyP) => Some("GAMEMENU"),
+        _ => None,
+    }
+}
+/// `CORUM_GAME=1`: play mode (mouse to walk, the original hotkeys open the windows).
+fn game_mode() -> bool {
+    env::var("CORUM_GAME").is_ok_and(|value| value != "0")
+}
 /// Radius, in tiles, of the player's body when walking and planning routes.
 const PLAYER_RADIUS: f32 = 0.20;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -79,16 +101,31 @@ fn run() -> Result<(), String> {
     let bytes =
         fs::read(&path).map_err(|error| format!("could not read '{}': {error}", path.display()))?;
     let map = TileMap::parse(&bytes).map_err(|error| error.to_string())?;
-    let static_model = if stm_path.is_file() {
-        let bytes = fs::read(&stm_path)
-            .map_err(|error| format!("could not read '{}': {error}", stm_path.display()))?;
-        Some(StaticModelFile::parse(&bytes).map_err(|error| error.to_string())?)
+    // The `.stm` sits next to the `.ttb` for a few maps; the rest live in `Map_stm.pak`.
+    let stm_bytes = if stm_path.is_file() {
+        Some(
+            fs::read(&stm_path)
+                .map_err(|error| format!("could not read '{}': {error}", stm_path.display()))?,
+        )
     } else {
-        eprintln!(
-            "STM not found at '{}'; showing collision only",
-            stm_path.display()
-        );
-        None
+        stm_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| {
+                open_data_package(&path, "Map_stm")
+                    .ok()
+                    .and_then(|archive| archive.read_entry(name).ok())
+            })
+    };
+    let static_model = match stm_bytes {
+        Some(bytes) => Some(StaticModelFile::parse(&bytes).map_err(|error| error.to_string())?),
+        None => {
+            eprintln!(
+                "STM not found for '{}' (next to the map or in Map_stm.pak); showing collision only",
+                stm_path.display()
+            );
+            None
+        }
     };
     let mut textures = static_model
         .as_ref()
@@ -123,6 +160,7 @@ fn run() -> Result<(), String> {
         }
     }
     scene.mob_model = load_actor(&path, "CORUM_MOB", DEFAULT_MOB_MODEL, tile_size);
+    scene.pending_ui = load_interface(&path);
     // Debug: `CORUM_PLAYER_AT=x,z` starts the player at those map-script coordinates, to point
     // the camera at a specific spot in repeatable screenshots.
     if let Some([x, z]) = env::var("CORUM_PLAYER_AT").ok().and_then(|value| {
@@ -144,6 +182,28 @@ fn run() -> Result<(), String> {
     event_loop
         .run_app(&mut application)
         .map_err(|error| error.to_string())
+}
+
+/// The original interface: its tables from `Data\Manager` and the images of the `UI` package.
+/// `CORUM_UI=off` turns it off; a missing table or package only disables the windows.
+fn load_interface(ttb_path: &Path) -> Option<(UiDesktop, Option<PakArchive>)> {
+    if env::var("CORUM_UI").is_ok_and(|value| value.eq_ignore_ascii_case("off")) {
+        return None;
+    }
+    let directory = data_directories(ttb_path).into_iter().find(|directory| {
+        directory
+            .join("Manager")
+            .join("InterfaceComponentInfo.cdb")
+            .is_file()
+    })?;
+    let catalog = UiCatalog::load(&directory.join("Manager"))
+        .map_err(|error| eprintln!("interface unavailable: {error}"))
+        .ok()?;
+    let archive = open_data_package(ttb_path, "UI")
+        .map_err(|error| eprintln!("interface images unavailable: {error}"))
+        .ok();
+    eprintln!("loaded interface: {} windows", catalog.frames().count());
+    Some((UiDesktop::new(catalog), archive))
 }
 
 /// Loads the actor named by `variable` (or `default`), given as `Package/entry`. A model that
@@ -318,6 +378,9 @@ impl SandboxApplication {
     }
 
     fn title(path: &Path, scene: &SandboxScene) -> String {
+        if game_mode() {
+            return "Corum Online (Rust) — clique: andar | T: inventário | A: personagem | S: habilidades | O: opções | Esc: fechar janela ou sair".to_owned();
+        }
         format!(
             "Corum Map Viewer — {} — {} — clique: andar | Tab: peça | Shift+Tab: anterior | 0: tudo | F: foco | G: colisão | H: entidades | L: luzes | B: brilho | O: objetos",
             path.file_name()
@@ -385,22 +448,68 @@ impl ApplicationHandler for SandboxApplication {
                 ..
             } => {
                 let pressed = state == ElementState::Pressed;
+                let window_size = (renderer.config.width as f32, renderer.config.height as f32);
+                let cursor = renderer
+                    .camera
+                    .last_cursor
+                    .map_or((0.0, 0.0), |cursor| (cursor.x, cursor.y));
                 if pressed {
+                    renderer.ui_captured = renderer.ui.as_mut().is_some_and(|ui| {
+                        let point = ui_gpu::to_screen(window_size, cursor);
+                        ui.desktop.press(point) != corum_assets::ui::Press::World
+                    });
                     renderer.camera.drag_distance = 0.0;
+                } else if let Some(ui) = &mut renderer.ui {
+                    ui.desktop.release();
                 }
-                renderer.camera.dragging = pressed;
-                // A click that did not turn into a drag is a move order (as in the original client).
-                if !pressed && renderer.camera.drag_distance < CLICK_DRAG_LIMIT {
+                renderer.camera.dragging = pressed && !renderer.ui_captured;
+                // A click that did not turn into a drag is a move order (as in the original client),
+                // unless it was for an interface window.
+                if !pressed
+                    && !renderer.ui_captured
+                    && renderer.camera.drag_distance < CLICK_DRAG_LIMIT
+                {
                     renderer.click_to_move();
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => renderer.camera.cursor_moved(position),
+            WindowEvent::CursorMoved { position, .. } => {
+                renderer.camera.cursor_moved(position);
+                let window_size = (renderer.config.width as f32, renderer.config.height as f32);
+                if let Some(ui) = &mut renderer.ui {
+                    ui.desktop
+                        .motion(ui_gpu::to_screen(window_size, (position.x, position.y)));
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => renderer.camera.zoom(delta),
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
+                    let hotkey = ui_hotkey(code, renderer.game_mode).filter(|_| pressed);
                     if pressed && code == KeyCode::Escape {
-                        event_loop.exit();
+                        // Escape closes the window on top; with none open it leaves the game.
+                        let closed = renderer
+                            .ui
+                            .as_mut()
+                            .is_some_and(|ui| ui.desktop.close_top());
+                        if !closed {
+                            event_loop.exit();
+                        }
+                    } else if let Some(name) = hotkey
+                        && renderer.ui.is_some()
+                    {
+                        if let Some(ui) = &mut renderer.ui
+                            && let Some(id) = ui.desktop.catalog().window_named(name)
+                        {
+                            ui.desktop.toggle(id);
+                        }
+                    } else if renderer.game_mode
+                        && matches!(
+                            code,
+                            KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD
+                        )
+                    {
+                        // In play mode the letters belong to the original hotkeys; the arrows
+                        // and the mouse move the character.
                     } else if pressed && code == KeyCode::KeyR {
                         renderer.reset_camera();
                     } else if pressed && code == KeyCode::Tab {
@@ -467,6 +576,8 @@ struct SandboxScene {
     moving: bool,
     /// Points still to walk to, in sandbox coordinates (the click-to-move route).
     route: Vec<Vec2>,
+    /// The original interface (windows and their images), handed to the renderer once.
+    pending_ui: Option<(UiDesktop, Option<PakArchive>)>,
 }
 
 impl SandboxScene {
@@ -530,6 +641,7 @@ impl SandboxScene {
             elapsed: 0.0,
             moving: false,
             route: Vec::new(),
+            pending_ui: None,
         })
     }
 
@@ -1442,6 +1554,10 @@ struct Renderer {
     camera: Camera,
     scene: SandboxScene,
     previous_frame: Instant,
+    ui: Option<UiGpu>,
+    /// The last press went to an interface window, so the release is not a move order.
+    ui_captured: bool,
+    game_mode: bool,
 }
 
 impl Renderer {
@@ -1450,6 +1566,7 @@ impl Renderer {
         scene: SandboxScene,
         textures: MapTextures,
     ) -> Result<Self, String> {
+        let mut scene = scene;
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
         let surface = instance
@@ -1690,6 +1807,9 @@ impl Renderer {
                 count: 0,
             });
         }
+        let ui = scene.pending_ui.take().map(|(desktop, archive)| {
+            UiGpu::new(&device, config.format, DEPTH_FORMAT, archive, desktop)
+        });
         eprintln!("uploaded {} triangles", vertices.len() / 3);
         Ok(Self {
             surface,
@@ -1714,6 +1834,9 @@ impl Renderer {
             camera,
             scene,
             previous_frame: Instant::now(),
+            ui,
+            ui_captured: false,
+            game_mode: game_mode(),
         })
     }
 
@@ -1782,6 +1905,13 @@ impl Renderer {
                 self.queue
                     .write_buffer(&prop.buffer, 0, bytemuck::cast_slice(&batch.vertices));
             }
+        }
+        if let Some(ui) = &mut self.ui {
+            ui.prepare(
+                &self.device,
+                &self.queue,
+                (self.config.width, self.config.height),
+            );
         }
         for actor in &mut self.actors {
             let placed = self.scene.actor_vertices(actor.kind);
@@ -1889,6 +2019,10 @@ impl Renderer {
                     pass.set_vertex_buffer(0, actor.buffer.slice(..));
                     pass.draw(0..actor.count, 0..1);
                 }
+            }
+            // The interface goes on top of everything, without depth.
+            if let Some(ui) = &self.ui {
+                ui.draw(&mut pass);
             }
         }
         self.queue.submit(Some(encoder.finish()));
